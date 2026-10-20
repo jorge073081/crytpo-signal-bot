@@ -1,17 +1,13 @@
 """
-Crypto Signal Bot Pro — chart guaranteed to show
-================================================
-- Binance data (working hosts)
-- Native Streamlit charts FIRST (always visible)
-- Plotly candlestick second (with hard-coded dark colors)
-- Auto-refresh OFF by default so the chart can finish painting
+Crypto Signal Bot Pro — working charts
+======================================
+Native Streamlit charts + simple Plotly candlestick (no broken subplots).
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from datetime import datetime, timezone
 import requests
 import time
@@ -42,7 +38,7 @@ HOSTS = ["https://data-api.binance.vision", "https://api.binance.us"]
 
 
 @st.cache_data(ttl=20, show_spinner=False)
-def fetch_klines(symbol: str, interval: str, limit: int = 300) -> tuple[pd.DataFrame, str]:
+def fetch_klines(symbol: str, interval: str, limit: int = 300):
     params = {"symbol": symbol, "interval": interval, "limit": min(int(limit), 1000)}
     for host in HOSTS:
         try:
@@ -106,63 +102,64 @@ def add_signals(df: pd.DataFrame) -> pd.DataFrame:
     return d.dropna(subset=["RSI"])
 
 
-def build_plotly_candle(df: pd.DataFrame, title: str) -> go.Figure:
-    x = list(df.index)
-    o = df["Open"].astype(float).values
-    h = df["High"].astype(float).values
-    l = df["Low"].astype(float).values
-    c = df["Close"].astype(float).values
-    v = df["Volume"].astype(float).values
-
-    fig = make_subplots(
-        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-        row_heights=[0.55, 0.22, 0.23],
-        subplot_titles=(title, "RSI (14)", "Volume"),
-    )
+def simple_candlestick(df: pd.DataFrame, title: str) -> go.Figure:
+    """Single-panel candlestick — no make_subplots (those break on some Streamlit Cloud hosts)."""
+    fig = go.Figure()
 
     fig.add_trace(go.Candlestick(
-        x=x, open=o, high=h, low=l, close=c, name="Price",
-        increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
-        increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350",
-    ), row=1, col=1)
+        x=df.index,
+        open=df["Open"],
+        high=df["High"],
+        low=df["Low"],
+        close=df["Close"],
+        name="OHLC",
+        increasing_line_color="#26a69a",
+        decreasing_line_color="#ef5350",
+        increasing_fillcolor="#26a69a",
+        decreasing_fillcolor="#ef5350",
+    ))
 
     fig.add_trace(go.Scatter(
-        x=x, y=df["EMA_fast"].astype(float).values, name="EMA 12",
+        x=df.index, y=df["EMA_fast"], name="EMA 12",
         line=dict(color="#ff6b6b", width=1.5),
-    ), row=1, col=1)
+    ))
     fig.add_trace(go.Scatter(
-        x=x, y=df["EMA_slow"].astype(float).values, name="EMA 26",
+        x=df.index, y=df["EMA_slow"], name="EMA 26",
         line=dict(color="#51cf66", width=1.5),
-    ), row=1, col=1)
+    ))
 
-    fig.add_trace(go.Scatter(
-        x=x, y=df["RSI"].astype(float).values, name="RSI",
-        line=dict(color="#cc5de8", width=1.5),
-    ), row=2, col=1)
-    fig.add_hline(y=70, line_dash="dash", line_color="#ef5350", row=2, col=1)
-    fig.add_hline(y=30, line_dash="dash", line_color="#26a69a", row=2, col=1)
+    # BUY / SELL markers
+    buys = df[df["Signal"] == "BUY"].tail(10)
+    sells = df[df["Signal"] == "SELL"].tail(10)
+    if len(buys):
+        fig.add_trace(go.Scatter(
+            x=buys.index, y=buys["Low"] * 0.998,
+            mode="markers", name="BUY",
+            marker=dict(symbol="triangle-up", size=10, color="#26a69a"),
+        ))
+    if len(sells):
+        fig.add_trace(go.Scatter(
+            x=sells.index, y=sells["High"] * 1.002,
+            mode="markers", name="SELL",
+            marker=dict(symbol="triangle-down", size=10, color="#ef5350"),
+        ))
 
-    colors = ["#26a69a" if cc >= oo else "#ef5350" for oo, cc in zip(o, c)]
-    fig.add_trace(go.Bar(x=x, y=v, name="Vol", marker_color=colors, opacity=0.75), row=3, col=1)
-
-    # HARD dark background so it is never white-on-white
     fig.update_layout(
-        height=700,
-        margin=dict(l=8, r=8, t=36, b=8),
+        title=title,
+        height=520,
+        margin=dict(l=10, r=10, t=40, b=10),
         paper_bgcolor="#0e1117",
         plot_bgcolor="#0e1117",
-        font=dict(color="#fafafa"),
+        font_color="#fafafa",
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
-        legend=dict(orientation="h", y=1.05, x=1, xanchor="right", bgcolor="rgba(0,0,0,0)"),
+        legend=dict(orientation="h", y=1.05, x=1, xanchor="right"),
         dragmode="zoom",
         modebar_add=["drawline", "drawopenpath", "drawclosedpath",
                      "drawcircle", "drawrect", "eraseshape"],
+        xaxis=dict(gridcolor="#333"),
+        yaxis=dict(gridcolor="#333"),
     )
-    for i in range(1, 4):
-        fig.update_xaxes(gridcolor="#222", row=i, col=1)
-        fig.update_yaxes(gridcolor="#222", row=i, col=1)
-    fig.update_yaxes(range=[0, 100], row=2, col=1)
     return fig
 
 
@@ -175,30 +172,29 @@ if custom.strip():
     symbol = custom.strip().upper()
     name = symbol
 
-interval = st.sidebar.selectbox("Candle size", INTERVALS, index=3)  # 15m default — more stable
+interval = st.sidebar.selectbox("Candle size", INTERVALS, index=3)
 limit = st.sidebar.select_slider("Candles", options=[100, 200, 300, 500], value=200)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔴 Live feed")
-# OFF by default so first paint completes
 live = st.sidebar.checkbox("Auto-refresh ON", value=False)
 secs = st.sidebar.slider("Seconds between updates", 8, 60, 15)
 if st.sidebar.button("🔄 Refresh now", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 
-st.sidebar.info("Turn Auto-refresh ON only AFTER you see the chart.")
+st.sidebar.caption("Turn Auto-refresh on after the chart appears.")
 
 # ── Main ──────────────────────────────────────────────────────
 st.title("⚡ Crypto Signal Bot Pro")
 st.caption(f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC · {name} · {symbol} · {interval}")
 
-with st.spinner("Loading market data…"):
+with st.spinner("Loading…"):
     raw, source = fetch_klines(symbol, interval, limit)
     df = add_signals(raw)
 
 if df.empty:
-    st.error("No data returned. Try another interval or symbol.")
+    st.error("No data. Try another interval or symbol.")
     st.stop()
 
 st.success(f"Data OK · **{source}** · {len(df)} candles · {interval}")
@@ -221,22 +217,10 @@ c5.metric("Candles", len(df))
 
 st.divider()
 
-# ══════════════════════════════════════════════════════════════
-# CHART SECTION — three layers so something ALWAYS shows
-# ══════════════════════════════════════════════════════════════
-
-st.subheader("1) Price (always visible — native Streamlit)")
-# This NEVER fails to render
-chart_df = df[["Close", "EMA_fast", "EMA_slow"]].copy()
-chart_df.columns = ["Close", "EMA 12", "EMA 26"]
-st.line_chart(chart_df, height=320, use_container_width=True)
-
-st.subheader("2) Volume (always visible)")
-st.bar_chart(df[["Volume"]], height=180, use_container_width=True)
-
-st.subheader("3) Full Candlestick + RSI (Plotly)")
+# ── Candlestick (simple, single panel) ────────────────────────
+st.subheader("📊 Candlestick Chart")
 try:
-    fig = build_plotly_candle(df, f"{name} · {interval}")
+    fig = simple_candlestick(df, f"{name} · {interval}")
     st.plotly_chart(
         fig,
         use_container_width=True,
@@ -250,20 +234,28 @@ try:
         },
     )
 except Exception as e:
-    st.warning(f"Plotly candlestick could not render: {e}")
-    st.info("Use the line chart above — data is live.")
+    st.warning(f"Candlestick unavailable ({e}). Showing line chart instead.")
+    st.line_chart(df[["Close", "EMA_fast", "EMA_slow"]], height=400)
 
-st.subheader("Recent data")
+# ── RSI + Volume as native charts (always work) ───────────────
+col_a, col_b = st.columns(2)
+with col_a:
+    st.subheader("RSI (14)")
+    st.line_chart(df[["RSI"]], height=220)
+with col_b:
+    st.subheader("Volume")
+    st.bar_chart(df[["Volume"]], height=220)
+
+st.subheader("Recent candles")
 st.dataframe(
     df[["Open", "High", "Low", "Close", "Volume", "RSI", "Score", "Signal"]]
       .sort_index(ascending=False)
-      .head(30),
+      .head(40),
     use_container_width=True,
-    height=260,
+    height=280,
 )
 
-# Auto-refresh only if user turned it on
 if live:
-    st.caption(f"Auto-refresh in {secs}s…")
+    st.caption(f"Refreshing in {secs}s…")
     time.sleep(secs)
     st.rerun()
