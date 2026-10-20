@@ -1,5 +1,7 @@
-streamlit>=1.30.0
+streamlit>=1.32.0
+yfinance>=0.2.36
+plotly>=5.18.0
 pandas>=2.0.0
-yfinance>=0.2.30
-pandas-ta-classic>=0.3.14
-plotly>=5.15.0
+numpy>=1.24.0
+# Optional but recommended for even cleaner indicators later:
+# ta>=0.11.0
