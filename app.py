@@ -1,8 +1,8 @@
 """
-Crypto Signal Bot Pro — reliable charts only
-============================================
-No Plotly candlesticks (they render as black boxes on some Streamlit Cloud hosts).
-Uses native Streamlit charts that already work for you + clear signals.
+Crypto Signal Bot Pro — tight, readable charts
+==============================================
+Native Streamlit charts only (no black Plotly boxes).
+Main price chart = Close + EMAs only so the scale stays tight.
 """
 
 import streamlit as st
@@ -91,6 +91,7 @@ def add_signals(df: pd.DataFrame) -> pd.DataFrame:
     d["BB_u"] = mid + 2 * std
     d["BB_mid"] = mid
     d["BB_l"] = mid - 2 * std
+    d["BB_width"] = (d["BB_u"] - d["BB_l"]) / mid * 100
 
     score = pd.Series(0.0, index=d.index)
     score += np.where(d["EMA_fast"] > d["EMA_slow"], 25, -25)
@@ -100,8 +101,6 @@ def add_signals(df: pd.DataFrame) -> pd.DataFrame:
     score += np.where(d["MACD"] > d["MACD_sig"], 15, -15)
     d["Score"] = score.clip(-100, 100).round(0)
     d["Signal"] = d["Score"].map(lambda x: "BUY" if x >= 35 else ("SELL" if x <= -35 else "HOLD"))
-    d["Range"] = d["High"] - d["Low"]
-    d["Body"] = (d["Close"] - d["Open"]).abs()
     return d.dropna(subset=["RSI"])
 
 
@@ -115,7 +114,7 @@ if custom.strip():
     name = symbol
 
 interval = st.sidebar.selectbox("Candle size", INTERVALS, index=3)
-limit = st.sidebar.select_slider("Candles", options=[100, 200, 300, 500], value=200)
+limit = st.sidebar.select_slider("Candles shown", options=[50, 100, 150, 200, 300], value=100)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔴 Live feed")
@@ -125,30 +124,32 @@ if st.sidebar.button("🔄 Refresh now", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 
-st.sidebar.caption("Turn Auto-refresh on after charts load.")
-
 # ── Main ──────────────────────────────────────────────────────
 st.title("⚡ Crypto Signal Bot Pro")
 st.caption(f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC · {name} · {symbol} · {interval}")
 
-with st.spinner("Loading market data…"):
-    raw, source = fetch_klines(symbol, interval, limit)
-    df = add_signals(raw)
+with st.spinner("Loading…"):
+    raw, source = fetch_klines(symbol, interval, max(limit, 100))
+    df_full = add_signals(raw)
 
-if df.empty:
+if df_full.empty:
     st.error("No data. Try another interval or symbol.")
     st.stop()
 
-st.success(f"Data OK · **{source}** · {len(df)} candles · {interval}")
+# Only show the last N candles so the chart is tight and readable
+df = df_full.tail(limit).copy()
+
+st.success(f"Data OK · **{source}** · showing last **{len(df)}** candles · {interval}")
 
 latest = df.iloc[-1]
 prev = df.iloc[-2]
 delta = float(latest["Close"] - prev["Close"])
+pct = delta / float(prev["Close"]) * 100
 price = float(latest["Close"])
 price_s = f"${price:,.6f}" if price < 1 else (f"${price:,.4f}" if price < 100 else f"${price:,.2f}")
 
 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Price", price_s, f"{delta:+.6f}" if abs(delta) < 1 else f"{delta:+.2f}")
+c1.metric("Price", price_s, f"{delta:+.4f} ({pct:+.2f}%)")
 sig = str(latest["Signal"])
 cls = {"BUY": "signal-buy", "SELL": "signal-sell", "HOLD": "signal-hold"}.get(sig, "")
 c2.markdown("**Signal**")
@@ -159,40 +160,42 @@ c5.metric("High / Low", f"{float(latest['High']):.4g} / {float(latest['Low']):.4
 
 st.divider()
 
-# ── Price chart (native — always works) ───────────────────────
-st.subheader(f"📈 {name} Price · {interval}")
-price_chart = df[["Close", "EMA_fast", "EMA_slow", "BB_u", "BB_l"]].copy()
-price_chart.columns = ["Close", "EMA 12", "EMA 26", "BB Upper", "BB Lower"]
-st.line_chart(price_chart, height=380, use_container_width=True)
+# ── MAIN PRICE (Close + EMAs only → tight y-scale) ────────────
+st.subheader(f"📈 {name} · Close + EMAs · {interval}")
+main = df[["Close", "EMA_fast", "EMA_slow"]].copy()
+main.columns = ["Close", "EMA 12", "EMA 26"]
+st.line_chart(main, height=400, use_container_width=True)
 
-# ── High / Low range (gives candle-like context) ──────────────
-st.subheader("High – Low range (candle wick proxy)")
-hl = df[["High", "Low", "Close"]].copy()
-st.line_chart(hl, height=260, use_container_width=True)
+# ── High / Low / Close (wick context, same tight window) ──────
+st.subheader("High · Low · Close")
+st.line_chart(df[["High", "Low", "Close"]], height=280, use_container_width=True)
 
 # ── RSI + Volume ──────────────────────────────────────────────
-left, right = st.columns(2)
-with left:
+a, b = st.columns(2)
+with a:
     st.subheader("RSI (14)")
     st.line_chart(df[["RSI"]], height=240, use_container_width=True)
     st.caption("Overbought > 70 · Oversold < 30")
-with right:
+with b:
     st.subheader("Volume")
     st.bar_chart(df[["Volume"]], height=240, use_container_width=True)
 
-# ── MACD hist as bar ──────────────────────────────────────────
+# ── MACD ──────────────────────────────────────────────────────
 st.subheader("MACD histogram")
 st.bar_chart(df[["MACD_hist"]], height=200, use_container_width=True)
 
-# ── Signal log ────────────────────────────────────────────────
-st.subheader("Recent candles + signals")
-show = df[["Open", "High", "Low", "Close", "Volume", "RSI", "MACD_hist", "Score", "Signal"]].copy()
-show = show.sort_index(ascending=False).head(50)
-st.dataframe(show, use_container_width=True, height=320)
+# ── Bollinger width (separate so it doesn't stretch price) ────
+st.subheader("Bollinger band width %")
+st.line_chart(df[["BB_width"]], height=180, use_container_width=True)
 
-st.caption(
-    "Plotly candlesticks are disabled on this deploy because they render as a black box "
-    "on Streamlit Cloud. Native charts above are live and update with Refresh / Auto-refresh."
+# ── Table ─────────────────────────────────────────────────────
+st.subheader("Recent candles + signals")
+st.dataframe(
+    df[["Open", "High", "Low", "Close", "Volume", "RSI", "MACD_hist", "Score", "Signal"]]
+      .sort_index(ascending=False)
+      .head(40),
+    use_container_width=True,
+    height=300,
 )
 
 if live:
