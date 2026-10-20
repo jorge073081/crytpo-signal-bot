@@ -1,6 +1,6 @@
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta_classic as ta
 
 def fetch_crypto_data(ticker: str, period: str = "60d", interval: str = "1h") -> pd.DataFrame:
     """Fetches historical market data from Yahoo Finance."""
