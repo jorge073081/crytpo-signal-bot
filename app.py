@@ -1,13 +1,14 @@
 """
-Crypto Signal Bot Pro — tight, readable charts
-==============================================
-Native Streamlit charts only (no black Plotly boxes).
-Main price chart = Close + EMAs only so the scale stays tight.
+Crypto Signal Bot Pro — readable price scale
+============================================
+Uses Altair with forced y-domain so price is NOT crushed at the top of a 0–90k axis.
+No Plotly candlesticks (black box on Streamlit Cloud).
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
+import altair as alt
 from datetime import datetime, timezone
 import requests
 import time
@@ -89,7 +90,6 @@ def add_signals(df: pd.DataFrame) -> pd.DataFrame:
     mid = c.rolling(20).mean()
     std = c.rolling(20).std()
     d["BB_u"] = mid + 2 * std
-    d["BB_mid"] = mid
     d["BB_l"] = mid - 2 * std
     d["BB_width"] = (d["BB_u"] - d["BB_l"]) / mid * 100
 
@@ -102,6 +102,64 @@ def add_signals(df: pd.DataFrame) -> pd.DataFrame:
     d["Score"] = score.clip(-100, 100).round(0)
     d["Signal"] = d["Score"].map(lambda x: "BUY" if x >= 35 else ("SELL" if x <= -35 else "HOLD"))
     return d.dropna(subset=["RSI"])
+
+
+def tight_line_chart(df: pd.DataFrame, cols: list, height: int = 400, title: str = ""):
+    """Altair line chart with y-axis locked to data range (no 0 baseline)."""
+    plot = df[cols].copy().reset_index()
+    time_col = plot.columns[0]
+    plot = plot.rename(columns={time_col: "Time"})
+    long = plot.melt("Time", var_name="Series", value_name="Value")
+
+    ymin = float(long["Value"].min())
+    ymax = float(long["Value"].max())
+    pad = (ymax - ymin) * 0.08 if ymax > ymin else abs(ymin) * 0.01 or 1
+    ymin -= pad
+    ymax += pad
+
+    chart = (
+        alt.Chart(long)
+        .mark_line(strokeWidth=2)
+        .encode(
+            x=alt.X("Time:T", title=None),
+            y=alt.Y("Value:Q", title=None, scale=alt.Scale(domain=[ymin, ymax], zero=False)),
+            color=alt.Color("Series:N", legend=alt.Legend(orient="top")),
+            tooltip=["Time:T", "Series:N", alt.Tooltip("Value:Q", format=".4f")],
+        )
+        .properties(height=height, title=title)
+        .interactive()
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
+def tight_bar_chart(df: pd.DataFrame, col: str, height: int = 220, title: str = ""):
+    plot = df[[col]].copy().reset_index()
+    time_col = plot.columns[0]
+    plot = plot.rename(columns={time_col: "Time", col: "Value"})
+
+    ymin = float(plot["Value"].min())
+    ymax = float(plot["Value"].max())
+    # bars often include 0; only force tight if all positive and far from 0
+    if ymin > 0 and ymin > (ymax - ymin) * 0.3:
+        pad = (ymax - ymin) * 0.1
+        domain = [ymin - pad, ymax + pad]
+        zero = False
+    else:
+        domain = [min(0, ymin), ymax * 1.05]
+        zero = True
+
+    chart = (
+        alt.Chart(plot)
+        .mark_bar(opacity=0.75)
+        .encode(
+            x=alt.X("Time:T", title=None),
+            y=alt.Y("Value:Q", title=None, scale=alt.Scale(domain=domain, zero=zero)),
+            tooltip=["Time:T", alt.Tooltip("Value:Q", format=".4f")],
+        )
+        .properties(height=height, title=title)
+        .interactive()
+    )
+    st.altair_chart(chart, use_container_width=True)
 
 
 # ── Sidebar ───────────────────────────────────────────────────
@@ -129,22 +187,21 @@ st.title("⚡ Crypto Signal Bot Pro")
 st.caption(f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC · {name} · {symbol} · {interval}")
 
 with st.spinner("Loading…"):
-    raw, source = fetch_klines(symbol, interval, max(limit, 100))
+    raw, source = fetch_klines(symbol, interval, max(limit + 50, 120))
     df_full = add_signals(raw)
 
 if df_full.empty:
     st.error("No data. Try another interval or symbol.")
     st.stop()
 
-# Only show the last N candles so the chart is tight and readable
 df = df_full.tail(limit).copy()
 
-st.success(f"Data OK · **{source}** · showing last **{len(df)}** candles · {interval}")
+st.success(f"Data OK · **{source}** · last **{len(df)}** candles · {interval}")
 
 latest = df.iloc[-1]
 prev = df.iloc[-2]
 delta = float(latest["Close"] - prev["Close"])
-pct = delta / float(prev["Close"]) * 100
+pct = delta / float(prev["Close"]) * 100 if prev["Close"] else 0
 price = float(latest["Close"])
 price_s = f"${price:,.6f}" if price < 1 else (f"${price:,.4f}" if price < 100 else f"${price:,.2f}")
 
@@ -160,35 +217,26 @@ c5.metric("High / Low", f"{float(latest['High']):.4g} / {float(latest['Low']):.4
 
 st.divider()
 
-# ── MAIN PRICE (Close + EMAs only → tight y-scale) ────────────
+# Price — tight scale
 st.subheader(f"📈 {name} · Close + EMAs · {interval}")
-main = df[["Close", "EMA_fast", "EMA_slow"]].copy()
-main.columns = ["Close", "EMA 12", "EMA 26"]
-st.line_chart(main, height=400, use_container_width=True)
+tight_line_chart(df, ["Close", "EMA_fast", "EMA_slow"], height=420)
 
-# ── High / Low / Close (wick context, same tight window) ──────
+# High / Low / Close — tight scale
 st.subheader("High · Low · Close")
-st.line_chart(df[["High", "Low", "Close"]], height=280, use_container_width=True)
+tight_line_chart(df, ["High", "Low", "Close"], height=300)
 
-# ── RSI + Volume ──────────────────────────────────────────────
 a, b = st.columns(2)
 with a:
     st.subheader("RSI (14)")
-    st.line_chart(df[["RSI"]], height=240, use_container_width=True)
+    tight_line_chart(df, ["RSI"], height=240)
     st.caption("Overbought > 70 · Oversold < 30")
 with b:
     st.subheader("Volume")
-    st.bar_chart(df[["Volume"]], height=240, use_container_width=True)
+    tight_bar_chart(df, "Volume", height=240)
 
-# ── MACD ──────────────────────────────────────────────────────
 st.subheader("MACD histogram")
-st.bar_chart(df[["MACD_hist"]], height=200, use_container_width=True)
+tight_bar_chart(df, "MACD_hist", height=200)
 
-# ── Bollinger width (separate so it doesn't stretch price) ────
-st.subheader("Bollinger band width %")
-st.line_chart(df[["BB_width"]], height=180, use_container_width=True)
-
-# ── Table ─────────────────────────────────────────────────────
 st.subheader("Recent candles + signals")
 st.dataframe(
     df[["Open", "High", "Low", "Close", "Volume", "RSI", "MACD_hist", "Score", "Signal"]]
