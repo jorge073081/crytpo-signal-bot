@@ -1,13 +1,13 @@
 """
-Crypto Signal Bot Pro — working charts
-======================================
-Native Streamlit charts + simple Plotly candlestick (no broken subplots).
+Crypto Signal Bot Pro — reliable charts only
+============================================
+No Plotly candlesticks (they render as black boxes on some Streamlit Cloud hosts).
+Uses native Streamlit charts that already work for you + clear signals.
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 from datetime import datetime, timezone
 import requests
 import time
@@ -16,10 +16,10 @@ st.set_page_config(page_title="Crypto Signal Bot Pro", page_icon="⚡", layout="
 
 st.markdown("""
 <style>
-div[data-testid="stMetricValue"] { font-size: 1.4rem; }
-.signal-buy  { color: #00c853; font-weight: 800; font-size: 1.6rem; }
-.signal-sell { color: #ff1744; font-weight: 800; font-size: 1.6rem; }
-.signal-hold { color: #ffab00; font-weight: 800; font-size: 1.6rem; }
+div[data-testid="stMetricValue"] { font-size: 1.45rem; }
+.signal-buy  { color: #00c853; font-weight: 800; font-size: 1.7rem; }
+.signal-sell { color: #ff1744; font-weight: 800; font-size: 1.7rem; }
+.signal-hold { color: #ffab00; font-weight: 800; font-size: 1.7rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -89,6 +89,7 @@ def add_signals(df: pd.DataFrame) -> pd.DataFrame:
     mid = c.rolling(20).mean()
     std = c.rolling(20).std()
     d["BB_u"] = mid + 2 * std
+    d["BB_mid"] = mid
     d["BB_l"] = mid - 2 * std
 
     score = pd.Series(0.0, index=d.index)
@@ -99,68 +100,9 @@ def add_signals(df: pd.DataFrame) -> pd.DataFrame:
     score += np.where(d["MACD"] > d["MACD_sig"], 15, -15)
     d["Score"] = score.clip(-100, 100).round(0)
     d["Signal"] = d["Score"].map(lambda x: "BUY" if x >= 35 else ("SELL" if x <= -35 else "HOLD"))
+    d["Range"] = d["High"] - d["Low"]
+    d["Body"] = (d["Close"] - d["Open"]).abs()
     return d.dropna(subset=["RSI"])
-
-
-def simple_candlestick(df: pd.DataFrame, title: str) -> go.Figure:
-    """Single-panel candlestick — no make_subplots (those break on some Streamlit Cloud hosts)."""
-    fig = go.Figure()
-
-    fig.add_trace(go.Candlestick(
-        x=df.index,
-        open=df["Open"],
-        high=df["High"],
-        low=df["Low"],
-        close=df["Close"],
-        name="OHLC",
-        increasing_line_color="#26a69a",
-        decreasing_line_color="#ef5350",
-        increasing_fillcolor="#26a69a",
-        decreasing_fillcolor="#ef5350",
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["EMA_fast"], name="EMA 12",
-        line=dict(color="#ff6b6b", width=1.5),
-    ))
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["EMA_slow"], name="EMA 26",
-        line=dict(color="#51cf66", width=1.5),
-    ))
-
-    # BUY / SELL markers
-    buys = df[df["Signal"] == "BUY"].tail(10)
-    sells = df[df["Signal"] == "SELL"].tail(10)
-    if len(buys):
-        fig.add_trace(go.Scatter(
-            x=buys.index, y=buys["Low"] * 0.998,
-            mode="markers", name="BUY",
-            marker=dict(symbol="triangle-up", size=10, color="#26a69a"),
-        ))
-    if len(sells):
-        fig.add_trace(go.Scatter(
-            x=sells.index, y=sells["High"] * 1.002,
-            mode="markers", name="SELL",
-            marker=dict(symbol="triangle-down", size=10, color="#ef5350"),
-        ))
-
-    fig.update_layout(
-        title=title,
-        height=520,
-        margin=dict(l=10, r=10, t=40, b=10),
-        paper_bgcolor="#0e1117",
-        plot_bgcolor="#0e1117",
-        font_color="#fafafa",
-        xaxis_rangeslider_visible=False,
-        hovermode="x unified",
-        legend=dict(orientation="h", y=1.05, x=1, xanchor="right"),
-        dragmode="zoom",
-        modebar_add=["drawline", "drawopenpath", "drawclosedpath",
-                     "drawcircle", "drawrect", "eraseshape"],
-        xaxis=dict(gridcolor="#333"),
-        yaxis=dict(gridcolor="#333"),
-    )
-    return fig
 
 
 # ── Sidebar ───────────────────────────────────────────────────
@@ -183,13 +125,13 @@ if st.sidebar.button("🔄 Refresh now", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 
-st.sidebar.caption("Turn Auto-refresh on after the chart appears.")
+st.sidebar.caption("Turn Auto-refresh on after charts load.")
 
 # ── Main ──────────────────────────────────────────────────────
 st.title("⚡ Crypto Signal Bot Pro")
 st.caption(f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC · {name} · {symbol} · {interval}")
 
-with st.spinner("Loading…"):
+with st.spinner("Loading market data…"):
     raw, source = fetch_klines(symbol, interval, limit)
     df = add_signals(raw)
 
@@ -213,46 +155,44 @@ c2.markdown("**Signal**")
 c2.markdown(f"<div class='{cls}'>{sig}</div>", unsafe_allow_html=True)
 c3.metric("RSI", f"{float(latest['RSI']):.1f}")
 c4.metric("Score", f"{int(latest['Score'])}")
-c5.metric("Candles", len(df))
+c5.metric("High / Low", f"{float(latest['High']):.4g} / {float(latest['Low']):.4g}")
 
 st.divider()
 
-# ── Candlestick (simple, single panel) ────────────────────────
-st.subheader("📊 Candlestick Chart")
-try:
-    fig = simple_candlestick(df, f"{name} · {interval}")
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-        config={
-            "scrollZoom": True,
-            "displaylogo": False,
-            "modeBarButtonsToAdd": [
-                "drawline", "drawopenpath", "drawclosedpath",
-                "drawcircle", "drawrect", "eraseshape",
-            ],
-        },
-    )
-except Exception as e:
-    st.warning(f"Candlestick unavailable ({e}). Showing line chart instead.")
-    st.line_chart(df[["Close", "EMA_fast", "EMA_slow"]], height=400)
+# ── Price chart (native — always works) ───────────────────────
+st.subheader(f"📈 {name} Price · {interval}")
+price_chart = df[["Close", "EMA_fast", "EMA_slow", "BB_u", "BB_l"]].copy()
+price_chart.columns = ["Close", "EMA 12", "EMA 26", "BB Upper", "BB Lower"]
+st.line_chart(price_chart, height=380, use_container_width=True)
 
-# ── RSI + Volume as native charts (always work) ───────────────
-col_a, col_b = st.columns(2)
-with col_a:
+# ── High / Low range (gives candle-like context) ──────────────
+st.subheader("High – Low range (candle wick proxy)")
+hl = df[["High", "Low", "Close"]].copy()
+st.line_chart(hl, height=260, use_container_width=True)
+
+# ── RSI + Volume ──────────────────────────────────────────────
+left, right = st.columns(2)
+with left:
     st.subheader("RSI (14)")
-    st.line_chart(df[["RSI"]], height=220)
-with col_b:
+    st.line_chart(df[["RSI"]], height=240, use_container_width=True)
+    st.caption("Overbought > 70 · Oversold < 30")
+with right:
     st.subheader("Volume")
-    st.bar_chart(df[["Volume"]], height=220)
+    st.bar_chart(df[["Volume"]], height=240, use_container_width=True)
 
-st.subheader("Recent candles")
-st.dataframe(
-    df[["Open", "High", "Low", "Close", "Volume", "RSI", "Score", "Signal"]]
-      .sort_index(ascending=False)
-      .head(40),
-    use_container_width=True,
-    height=280,
+# ── MACD hist as bar ──────────────────────────────────────────
+st.subheader("MACD histogram")
+st.bar_chart(df[["MACD_hist"]], height=200, use_container_width=True)
+
+# ── Signal log ────────────────────────────────────────────────
+st.subheader("Recent candles + signals")
+show = df[["Open", "High", "Low", "Close", "Volume", "RSI", "MACD_hist", "Score", "Signal"]].copy()
+show = show.sort_index(ascending=False).head(50)
+st.dataframe(show, use_container_width=True, height=320)
+
+st.caption(
+    "Plotly candlesticks are disabled on this deploy because they render as a black box "
+    "on Streamlit Cloud. Native charts above are live and update with Refresh / Auto-refresh."
 )
 
 if live:
