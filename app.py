@@ -470,7 +470,7 @@ if page == "Multi-ticker scanner":
                 alerts.append(("sell", f"**SELL** {r['Asset']} · HTF {r['HTF']} · R:R {r['R:R']} · RSI {r['RSI']} · {r['Flags']}"))
             elif r["Signal"] in ("BUY", "SELL"):
                 alerts.append(("sell" if r["Signal"] == "SELL" else "buy",
-                               f"{r['Signal']} {r['Asset']} but R:R {r.get('R:R')} < min {min_rr} — skip")))
+                               f"{r['Signal']} {r['Asset']} but R:R {r.get('R:R')} < min {min_rr} — skip"))
     if not alerts:
         st.info("No trades pass trend filter + min R:R right now.")
     else:
