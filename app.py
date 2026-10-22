@@ -1,17 +1,17 @@
 """
-Crypto Spot Desk — Buy Low / Sell High
-======================================
-Spot only (cash ↔ coin). No shorts. No leverage. No learning module.
+Crypto Spot Desk — Buy Low / Sell High + Live feed + Alerts
+===========================================================
+Spot only. No shorts. No leverage. No learning module.
 
-Pulls public context from:
-  • Binance (price, volume, funding bias)
-  • Crypto Fear & Greed (alternative.me)
-  • CoinGecko global (dominance, mcap)
-  • FRED macro (10Y, Fed funds, unemployment via public CSV)
-  • News headlines (RSS)
+Data (public):
+  Binance price/volume/funding/OI/long-short
+  Fear & Greed, CoinGecko global + trending
+  FRED macro, RSS news, mempool (BTC)
 
-Outputs a simple ENTRY and EXIT price with a trader-style checklist.
-Not financial advice. Not guaranteed profit. You place orders yourself.
+Live feed: optional auto-refresh
+Alerts: on-screen + toast + optional webhook (Discord/Telegram URL)
+
+Not financial advice. Not guaranteed profit.
 """
 
 import streamlit as st
@@ -23,8 +23,9 @@ import requests
 import time
 import xml.etree.ElementTree as ET
 from io import StringIO
+import json
 
-st.set_page_config(page_title="Spot Desk · Buy Low Sell High", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Spot Desk · Live", page_icon="⚡", layout="wide")
 
 st.markdown("""
 <style>
@@ -39,8 +40,19 @@ st.markdown("""
   padding: 1.2rem 1.4rem;
   margin-bottom: 0.6rem;
 }
-.ok { color: #00c853; } .no { color: #ff5252; } .mu { color: #ffc107; }
+.alert-buy {
+  background: rgba(0,200,83,0.18);
+  border-left: 5px solid #00c853;
+  padding: 12px 16px; border-radius: 8px; font-weight: 700; margin: 8px 0;
+}
+.alert-sell {
+  background: rgba(255,171,0,0.18);
+  border-left: 5px solid #ffab00;
+  padding: 12px 16px; border-radius: 8px; font-weight: 700; margin: 8px 0;
+}
+.ok { color: #00c853; } .no { color: #ff5252; }
 .small { color: #9e9e9e; font-size: 0.88rem; }
+.live-dot { color: #ff1744; font-weight: 800; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -72,8 +84,7 @@ def fmt(x):
     return f"${x:,.2f}"
 
 
-# ── Data fetchers ─────────────────────────────────────────────
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def binance_klines(symbol, interval, limit=250):
     params = {"symbol": symbol, "interval": interval, "limit": min(limit, 1000)}
     for host in BINANCE:
@@ -98,32 +109,51 @@ def binance_klines(symbol, interval, limit=250):
     return pd.DataFrame()
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=45, show_spinner=False)
 def binance_funding(symbol):
-    """Perp funding as sentiment (even for spot decisions)."""
     for host in ["https://fapi.binance.com", "https://data-api.binance.vision"]:
         try:
-            # last funding rate
-            r = requests.get(
-                f"{host}/fapi/v1/fundingRate",
-                params={"symbol": symbol, "limit": 3},
-                timeout=8,
-            )
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            if data:
-                return float(data[-1]["fundingRate"])
+            r = requests.get(f"{host}/fapi/v1/fundingRate", params={"symbol": symbol, "limit": 2}, timeout=8)
+            if r.status_code == 200 and r.json():
+                return float(r.json()[-1]["fundingRate"])
         except Exception:
             continue
     return None
 
 
+@st.cache_data(ttl=45, show_spinner=False)
+def binance_oi(symbol):
+    for host in ["https://fapi.binance.com"]:
+        try:
+            r = requests.get(f"{host}/fapi/v1/openInterest", params={"symbol": symbol}, timeout=8)
+            if r.status_code == 200:
+                return float(r.json().get("openInterest", 0))
+        except Exception:
+            continue
+    return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def binance_long_short(symbol):
+    """Global long/short account ratio (futures sentiment)."""
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
+            params={"symbol": symbol, "period": "1h", "limit": 1},
+            timeout=8,
+        )
+        if r.status_code == 200 and r.json():
+            row = r.json()[-1]
+            return float(row.get("longShortRatio", 0)), float(row.get("longAccount", 0)), float(row.get("shortAccount", 0))
+    except Exception:
+        pass
+    return None, None, None
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def fear_greed():
     try:
-        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8)
-        d = r.json()["data"][0]
+        d = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8).json()["data"][0]
         return int(d["value"]), d["value_classification"]
     except Exception:
         return None, None
@@ -132,8 +162,7 @@ def fear_greed():
 @st.cache_data(ttl=180, show_spinner=False)
 def coingecko_global():
     try:
-        r = requests.get("https://api.coingecko.com/api/v3/global", timeout=10)
-        g = r.json()["data"]
+        g = requests.get("https://api.coingecko.com/api/v3/global", timeout=10).json()["data"]
         return {
             "mcap_chg_24h": g.get("market_cap_change_percentage_24h_usd"),
             "btc_dom": g.get("market_cap_percentage", {}).get("btc"),
@@ -143,28 +172,45 @@ def coingecko_global():
         return {}
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def coingecko_trending():
+    try:
+        coins = requests.get("https://api.coingecko.com/api/v3/search/trending", timeout=10).json().get("coins", [])
+        return [c.get("item", {}).get("name") for c in coins[:7] if c.get("item")]
+    except Exception:
+        return []
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def fred_last(series_id: str):
-    """Public FRED CSV — no API key required."""
+def fred_last(series_id):
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
     try:
         r = requests.get(url, timeout=12, headers={"User-Agent": "SpotDesk/1.0"})
         if r.status_code != 200:
-            return None, None
-        df = pd.read_csv(StringIO(r.text))
-        df = df.replace(".", np.nan).dropna()
+            return None
+        df = pd.read_csv(StringIO(r.text)).replace(".", np.nan).dropna()
         if df.empty or len(df.columns) < 2:
-            return None, None
+            return None
         df.iloc[:, 1] = pd.to_numeric(df.iloc[:, 1], errors="coerce")
         df = df.dropna()
-        return float(df.iloc[-1, 1]), str(df.iloc[-1, 0])
+        return float(df.iloc[-1, 1])
     except Exception:
-        return None, None
+        return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def mempool_fees():
+    try:
+        r = requests.get("https://mempool.space/api/v1/fees/recommended", timeout=8)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return {}
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def news_headlines(query: str = "cryptocurrency", limit: int = 8):
-    """RSS — CoinDesk + Google News."""
+def news_headlines(query="cryptocurrency", limit=8):
     items = []
     feeds = [
         "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -177,18 +223,30 @@ def news_headlines(query: str = "cryptocurrency", limit: int = 8):
                 continue
             root = ET.fromstring(r.content)
             for item in root.iter("item"):
-                title = item.findtext("title") or ""
+                title = (item.findtext("title") or "").strip()
                 link = item.findtext("link") or ""
-                pub = item.findtext("pubDate") or ""
                 if title:
-                    items.append({"title": title.strip(), "link": link, "pub": pub})
+                    items.append({"title": title, "link": link})
                 if len(items) >= limit:
-                    break
+                    return items
         except Exception:
             continue
-        if len(items) >= limit:
-            break
     return items[:limit]
+
+
+def send_webhook(url: str, content: str):
+    if not url or not url.startswith("http"):
+        return False
+    try:
+        # Discord-style
+        r = requests.post(url, json={"content": content}, timeout=8)
+        if r.status_code < 300:
+            return True
+        # Telegram bot style: user pastes full API URL sometimes
+        r2 = requests.post(url, json={"text": content}, timeout=8)
+        return r2.status_code < 300
+    except Exception:
+        return False
 
 
 def ema(s, n):
@@ -196,8 +254,8 @@ def ema(s, n):
 
 def rsi(s, n=14):
     d = s.diff()
-    g = d.clip(lower=0).ewm(alpha=1 / n, min_periods=n).mean()
-    l = (-d.clip(upper=0)).ewm(alpha=1 / n, min_periods=n).mean()
+    g = d.clip(lower=0).ewm(alpha=1/n, min_periods=n).mean()
+    l = (-d.clip(upper=0)).ewm(alpha=1/n, min_periods=n).mean()
     return 100 - (100 / (1 + g / l.replace(0, np.nan)))
 
 def atr_s(df, n=14):
@@ -210,7 +268,8 @@ def trend_bias(df):
     if df.empty or len(df) < 30:
         return "RANGE"
     c = df["Close"]
-    e12, e26, e50 = ema(c, 12), ema(c, 26), ema(c, min(50, len(df) // 2))
+    e12, e26 = ema(c, 12), ema(c, 26)
+    e50 = ema(c, min(50, max(20, len(df)//2)))
     last = c.iloc[-1]
     if e12.iloc[-1] > e26.iloc[-1] > e50.iloc[-1] and last > e26.iloc[-1]:
         return "UP"
@@ -226,8 +285,7 @@ def technicals(df):
     d["EMA26"] = ema(c, 26)
     d["RSI"] = rsi(c)
     d["ATR"] = atr_s(d)
-    mid = c.rolling(20).mean()
-    std = c.rolling(20).std()
+    mid, std = c.rolling(20).mean(), c.rolling(20).std()
     d["BB_u"], d["BB_l"] = mid + 2 * std, mid - 2 * std
     d["BB_pct"] = (c - d["BB_l"]) / (d["BB_u"] - d["BB_l"]).replace(0, np.nan)
     d["Swing_low"] = d["Low"].rolling(20).min()
@@ -236,11 +294,7 @@ def technicals(df):
     return d.dropna()
 
 
-def trader_decision(last, htf, fng_val, fng_label, global_m, funding, macro):
-    """
-    Spot trader logic: combine technicals + sentiment + macro.
-    Returns action BUY|SELL|WAIT, entry, exit, stop, reasons list.
-    """
+def trader_decision(last, htf, fng_val, fng_label, global_m, funding, ls_ratio, macro):
     price = float(last["Close"])
     rsi_v = float(last["RSI"])
     bb = float(last["BB_pct"]) if pd.notna(last["BB_pct"]) else 0.5
@@ -250,73 +304,53 @@ def trader_decision(last, htf, fng_val, fng_label, global_m, funding, macro):
 
     stop = min(price - 1.5 * atr, float(last["Swing_low"]) * 0.998)
     risk = max(price - stop, atr * 0.5)
-    exit_px = price + 2.0 * risk  # 2R target
+    exit_px = price + 2.0 * risk
 
-    checks = []  # (name, bullish_for_buy, detail)
-
-    # Technical value
-    checks.append(("Price near lows (BB)", bb < 0.35, f"BB position {bb*100:.0f}%"))
-    checks.append(("RSI not expensive", rsi_v < 55, f"RSI {rsi_v:.0f}"))
-    checks.append(("RSI oversold bonus", rsi_v < 35, f"RSI {rsi_v:.0f}"))
-    checks.append(("Local trend OK", local_up or htf != "DOWN", "EMA12 vs EMA26"))
-    checks.append(("HTF not hard DOWN", htf in ("UP", "RANGE"), f"HTF={htf}"))
-    checks.append(("Volume alive", vol_ok, f"Vol vs MA {float(last.get('Vol_ratio') or 0):.1f}x"))
-
-    # Sentiment
+    checks = [
+        ("Near value (BB low zone)", bb < 0.35, f"BB {bb*100:.0f}%"),
+        ("RSI not expensive", rsi_v < 55, f"RSI {rsi_v:.0f}"),
+        ("RSI oversold", rsi_v < 35, f"RSI {rsi_v:.0f}"),
+        ("Local trend OK", local_up or htf != "DOWN", "EMA12/26"),
+        ("HTF not hard DOWN", htf in ("UP", "RANGE"), f"HTF={htf}"),
+        ("Volume alive", vol_ok, f"{float(last.get('Vol_ratio') or 0):.1f}x MA"),
+    ]
     if fng_val is not None:
-        checks.append(("Fear & Greed not extreme greed", fng_val < 75, f"{fng_val} ({fng_label})"))
-        checks.append(("Fear supports buy-low", fng_val <= 40, f"{fng_val} ({fng_label})"))
+        checks.append(("Not extreme greed", fng_val < 75, f"{fng_val} {fng_label}"))
+        checks.append(("Fear helps buy-low", fng_val <= 40, f"{fng_val} {fng_label}"))
     if funding is not None:
-        # negative funding → perps short squeeze risk / cheaper to be long-biased spot
-        checks.append(("Funding not overheated long", funding < 0.0005, f"{funding*100:.4f}%"))
+        checks.append(("Funding not overheated", funding < 0.0005, f"{funding*100:.4f}%"))
+    if ls_ratio is not None:
+        # very high long ratio = crowded longs = caution on new buys
+        checks.append(("Longs not extremely crowded", ls_ratio < 2.2, f"L/S {ls_ratio:.2f}"))
     if global_m.get("mcap_chg_24h") is not None:
         chg = float(global_m["mcap_chg_24h"])
-        checks.append(("Market not in free-fall", chg > -5, f"Global mcap 24h {chg:+.1f}%"))
-    if global_m.get("btc_dom") is not None:
-        checks.append(("BTC dominance readable", True, f"BTC dom {float(global_m['btc_dom']):.1f}%"))
+        checks.append(("Market not crashing", chg > -5, f"Mcap 24h {chg:+.1f}%"))
+    if macro.get("DGS10") is not None:
+        checks.append(("Yields not extreme", macro["DGS10"] < 5.5, f"10Y {macro['DGS10']:.2f}%"))
 
-    # Macro: rising yields often risk-off for crypto
-    dgs10 = macro.get("DGS10")
-    fed = macro.get("FEDFUNDS")
-    if dgs10 is not None:
-        checks.append(("10Y yield context loaded", True, f"10Y {dgs10:.2f}%"))
-        # very high yields = caution on new risk buys
-        checks.append(("Yields not extreme spike zone", dgs10 < 5.5, f"10Y {dgs10:.2f}%"))
-    if fed is not None:
-        checks.append(("Fed funds loaded", True, f"FF {fed:.2f}%"))
-
-    bullish_votes = sum(1 for _, ok, _ in checks if ok)
+    votes = sum(1 for _, ok, _ in checks if ok)
     total = len(checks)
-
-    # Sell-high: expensive technicals
     sell_high = rsi_v >= 65 or bb >= 0.78 or (fng_val is not None and fng_val >= 78 and bb > 0.6)
-
-    # Buy-low: enough confluence + value
-    buy_low = (
-        not sell_high
-        and htf != "DOWN"
-        and bullish_votes >= max(4, total // 2)
-        and (bb < 0.4 or rsi_v < 40)
-    )
+    buy_low = (not sell_high) and htf != "DOWN" and votes >= max(4, total // 2) and (bb < 0.4 or rsi_v < 40)
 
     if buy_low:
         action = "BUY"
     elif sell_high:
         action = "SELL"
-        exit_px = price  # sell at market when signal is sell
-        stop = price  # N/A for pure exit
+        exit_px = price
+        stop = None
     else:
         action = "WAIT"
 
     return {
         "action": action,
         "entry": price if action == "BUY" else None,
-        "exit": exit_px if action == "BUY" else (price if action == "SELL" else float(last["BB_u"])),
-        "stop": stop if action == "BUY" else None,
+        "exit": exit_px if action != "WAIT" else float(last["BB_u"]),
+        "stop": stop,
         "buy_zone": float(last["BB_l"]),
         "sell_zone": float(last["BB_u"]),
         "checks": checks,
-        "votes": bullish_votes,
+        "votes": votes,
         "total": total,
         "rsi": rsi_v,
         "bb": bb,
@@ -331,15 +365,13 @@ def chart_price(df):
     ymin, ymax = float(plot["Price"].min()), float(plot["Price"].max())
     pad = (ymax - ymin) * 0.08 or 1
     ch = (
-        alt.Chart(plot)
-        .mark_line(color="#42a5f5", strokeWidth=2)
+        alt.Chart(plot).mark_line(color="#42a5f5", strokeWidth=2)
         .encode(
             x=alt.X("Time:T", title=None),
-            y=alt.Y("Price:Q", scale=alt.Scale(domain=[ymin - pad, ymax + pad], zero=False), title=None),
+            y=alt.Y("Price:Q", scale=alt.Scale(domain=[ymin-pad, ymax+pad], zero=False), title=None),
             tooltip=["Time:T", alt.Tooltip("Price:Q", format=".4f")],
         )
-        .properties(height=300)
-        .interactive()
+        .properties(height=300).interactive()
     )
     st.altair_chart(ch, use_container_width=True)
 
@@ -356,84 +388,119 @@ if custom.strip():
 interval = st.sidebar.selectbox("Timeframe", INTERVALS, index=0)
 account = st.sidebar.number_input("Account $", 100.0, value=10000.0, step=100.0)
 risk_pct = st.sidebar.slider("Risk % if stopped", 0.25, 2.0, 0.5, 0.25)
-if st.sidebar.button("Refresh data"):
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔴 Live feed")
+live = st.sidebar.checkbox("Auto-refresh ON", value=False)
+secs = st.sidebar.slider("Seconds between updates", 15, 120, 30)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔔 Alerts")
+alert_on = st.sidebar.checkbox("Alert on BUY / SELL", value=True)
+webhook = st.sidebar.text_input(
+    "Webhook URL (optional)",
+    placeholder="Discord webhook or similar",
+    help="Posts a message when signal flips to BUY or SELL",
+)
+
+if st.sidebar.button("Refresh now"):
     st.cache_data.clear()
     st.rerun()
 
-st.sidebar.markdown("---")
-st.sidebar.caption(
-    "Sources: Binance · Fear&Greed · CoinGecko · FRED · RSS news\n"
-    "Spot only. You execute trades yourself."
-)
+st.sidebar.caption("Spot only · public data · you place orders")
 
-# ── Load everything ───────────────────────────────────────────
+# ── Load ──────────────────────────────────────────────────────
+now = datetime.now(timezone.utc)
 st.title(f"{name}")
-st.caption(f"Spot desk · {interval} · {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+if live:
+    st.markdown(f"<span class='live-dot'>● LIVE</span> · {interval} · {now.strftime('%H:%M:%S')} UTC · refresh every {secs}s", unsafe_allow_html=True)
+else:
+    st.caption(f"{interval} · {now.strftime('%Y-%m-%d %H:%M:%S')} UTC · turn on Live feed in sidebar")
 
-with st.spinner("Pulling exchange, macro, sentiment, news…"):
+with st.spinner("Updating exchange · macro · sentiment · news…"):
     raw = binance_klines(symbol, interval, 250)
     htf_raw = binance_klines(symbol, HTF_MAP.get(interval, "1h"), 120)
     htf = trend_bias(htf_raw) if not htf_raw.empty else "RANGE"
     fng_val, fng_label = fear_greed()
     global_m = coingecko_global()
+    trending = coingecko_trending()
     funding = binance_funding(symbol)
-    dgs10, dgs10_d = fred_last("DGS10")
-    fed, fed_d = fred_last("FEDFUNDS")
-    unrate, unrate_d = fred_last("UNRATE")
-    macro = {"DGS10": dgs10, "FEDFUNDS": fed, "UNRATE": unrate}
-    news = news_headlines(name if name.isalpha() else "crypto", 8)
+    oi = binance_oi(symbol)
+    ls_ratio, long_acc, short_acc = binance_long_short(symbol)
+    macro = {
+        "DGS10": fred_last("DGS10"),
+        "FEDFUNDS": fred_last("FEDFUNDS"),
+        "UNRATE": fred_last("UNRATE"),
+    }
+    fees = mempool_fees() if "BTC" in symbol else {}
+    news = news_headlines(name if name.replace(" ", "").isalpha() else "crypto", 8)
 
 if raw.empty:
-    st.error("No exchange price data. Try again or another pair.")
+    st.error("No price data from exchange.")
     st.stop()
 
 df = technicals(raw)
 if df.empty:
-    st.error("Not enough bars for indicators.")
+    st.error("Not enough candles.")
     st.stop()
 
 last = df.iloc[-1]
-dec = trader_decision(last, htf, fng_val, fng_label, global_m, funding, macro)
+dec = trader_decision(last, htf, fng_val, fng_label, global_m, funding, ls_ratio, macro)
 
-# Position size on buy
+# ── Alerts on signal change ───────────────────────────────────
+prev = st.session_state.get("last_action")
+action = dec["action"]
+if alert_on and action in ("BUY", "SELL"):
+    msg = (
+        f"{'🟢 BUY LOW' if action=='BUY' else '🟠 SELL HIGH'} {name} ({symbol})\n"
+        f"Price {fmt(dec['price'])}\n"
+        f"Entry {fmt(dec.get('entry'))} · Exit {fmt(dec.get('exit'))}\n"
+        f"RSI {dec['rsi']:.0f} · HTF {htf} · {now.strftime('%H:%M UTC')}"
+    )
+    if action == "BUY":
+        st.markdown(f"<div class='alert-buy'>🔔 BUY ALERT — Entry {fmt(dec['entry'])} · Exit target {fmt(dec['exit'])}</div>", unsafe_allow_html=True)
+    else:
+        st.markdown(f"<div class='alert-sell'>🔔 SELL ALERT — Exit {fmt(dec['exit'])} (sell coin for cash)</div>", unsafe_allow_html=True)
+
+    if prev != action:
+        st.toast(f"{action} signal on {name}", icon="🔔")
+        if webhook.strip():
+            ok = send_webhook(webhook.strip(), msg)
+            if ok:
+                st.caption("Webhook alert sent.")
+            else:
+                st.caption("Webhook failed (check URL).")
+st.session_state["last_action"] = action
+
+# Size
 size = 0.0
-if dec["action"] == "BUY" and dec["stop"] and dec["entry"]:
+if action == "BUY" and dec.get("stop") and dec.get("entry"):
     risk_amt = dec["entry"] - dec["stop"]
     if risk_amt > 0:
         size = (account * risk_pct / 100.0) / risk_amt
 
-# ── MAIN: Entry / Exit ────────────────────────────────────────
-if dec["action"] == "BUY":
+# ── Main decision card ────────────────────────────────────────
+if action == "BUY":
     st.markdown(
         f"""
         <div class="card">
-          <div class="small">TRADER DECISION · SPOT</div>
+          <div class="small">SPOT DECISION</div>
           <div class="big buy">BUY</div>
-          <p style="font-size:1.2rem;margin-top:0.8rem">
-            <b>Entry price</b><br><span class="big buy">{fmt(dec['entry'])}</span>
-          </p>
-          <p style="font-size:1.2rem">
-            <b>Exit price</b> (take profit target)<br><span class="big sell">{fmt(dec['exit'])}</span>
-          </p>
-          <p class="small">
-            Stop: {fmt(dec['stop'])} ·
-            Size ≈ {size:.6g} coins at {risk_pct}% risk on ${account:,.0f} ·
-            Confluence {dec['votes']}/{dec['total']}
-          </p>
+          <p style="font-size:1.2rem;margin-top:0.8rem"><b>Entry price</b><br><span class="big buy">{fmt(dec['entry'])}</span></p>
+          <p style="font-size:1.2rem"><b>Exit price</b><br><span class="big sell">{fmt(dec['exit'])}</span></p>
+          <p class="small">Stop {fmt(dec['stop'])} · Size ≈ {size:.6g} · Checklist {dec['votes']}/{dec['total']}</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
-elif dec["action"] == "SELL":
+elif action == "SELL":
     st.markdown(
         f"""
         <div class="card">
-          <div class="small">TRADER DECISION · SPOT</div>
+          <div class="small">SPOT DECISION</div>
           <div class="big sell">SELL</div>
-          <p style="font-size:1.2rem;margin-top:0.8rem">
-            <b>Exit price</b> (sell coin for cash)<br><span class="big sell">{fmt(dec['exit'])}</span>
-          </p>
-          <p class="small">If you hold this coin, consider selling. Not a short. Next buy zone ≈ {fmt(dec['buy_zone'])}</p>
+          <p style="font-size:1.2rem;margin-top:0.8rem"><b>Exit price</b><br><span class="big sell">{fmt(dec['exit'])}</span></p>
+          <p class="small">Sell coin for cash. Next buy zone ≈ {fmt(dec['buy_zone'])}</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -442,84 +509,66 @@ else:
     st.markdown(
         f"""
         <div class="card">
-          <div class="small">TRADER DECISION · SPOT</div>
+          <div class="small">SPOT DECISION</div>
           <div class="big wait">WAIT</div>
-          <p style="margin-top:0.8rem">Current price <b>{fmt(dec['price'])}</b></p>
-          <p>
-            Watch <b>entry zone</b> ≈ {fmt(dec['buy_zone'])}<br>
-            Watch <b>exit zone</b> ≈ {fmt(dec['sell_zone'])}
-          </p>
-          <p class="small">Confluence {dec['votes']}/{dec['total']} — not enough for a clean buy-low setup.</p>
+          <p>Price <b>{fmt(dec['price'])}</b></p>
+          <p>Buy zone ≈ {fmt(dec['buy_zone'])} · Sell zone ≈ {fmt(dec['sell_zone'])}</p>
+          <p class="small">Checklist {dec['votes']}/{dec['total']}</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-# Context strip
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Price", fmt(dec["price"]))
-c2.metric("RSI", f"{dec['rsi']:.0f}")
-c3.metric("HTF trend", htf)
-c4.metric("Fear & Greed", f"{fng_val}" if fng_val is not None else "—", fng_label or None)
-c5.metric("BTC dom", f"{global_m['btc_dom']:.1f}%" if global_m.get("btc_dom") else "—")
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Price", fmt(dec["price"]))
+m2.metric("RSI", f"{dec['rsi']:.0f}")
+m3.metric("HTF", htf)
+m4.metric("Fear & Greed", f"{fng_val}" if fng_val is not None else "—", fng_label)
+m5.metric("BTC dom", f"{global_m['btc_dom']:.1f}%" if global_m.get("btc_dom") else "—")
 
 st.divider()
-
-# Market context panels
-left, right = st.columns(2)
-with left:
-    st.subheader("Exchange & technicals")
-    st.write(f"BB position: **{dec['bb']*100:.0f}%** (0=low, 100=high)")
-    st.write(f"ATR: **{fmt(dec['atr'])}**")
-    if funding is not None:
-        st.write(f"Perp funding (sentiment): **{funding*100:.4f}%**")
-    else:
-        st.write("Perp funding: unavailable")
-    if global_m.get("mcap_chg_24h") is not None:
-        st.write(f"Global crypto mcap 24h: **{float(global_m['mcap_chg_24h']):+.2f}%**")
-
-with right:
+a, b, c = st.columns(3)
+with a:
+    st.subheader("Exchange")
+    st.write(f"BB: **{dec['bb']*100:.0f}%** · ATR: **{fmt(dec['atr'])}**")
+    st.write(f"Funding: **{funding*100:.4f}%**" if funding is not None else "Funding: —")
+    st.write(f"Open interest: **{oi:,.0f}**" if oi else "OI: —")
+    if ls_ratio is not None:
+        st.write(f"Long/Short ratio: **{ls_ratio:.2f}**")
+with b:
     st.subheader("Macro (FRED)")
-    st.write(f"10Y Treasury: **{dgs10:.2f}%**" if dgs10 is not None else "10Y: —")
-    st.write(f"Fed funds: **{fed:.2f}%**" if fed is not None else "Fed funds: —")
-    st.write(f"Unemployment: **{unrate:.2f}%**" if unrate is not None else "Unemployment: —")
-    st.caption("Public FRED series · risk assets often sensitive to yields")
+    st.write(f"10Y: **{macro['DGS10']:.2f}%**" if macro.get("DGS10") else "10Y: —")
+    st.write(f"Fed funds: **{macro['FEDFUNDS']:.2f}%**" if macro.get("FEDFUNDS") else "Fed: —")
+    st.write(f"Unemployment: **{macro['UNRATE']:.2f}%**" if macro.get("UNRATE") else "Unemp: —")
+with c:
+    st.subheader("Market / chain")
+    if global_m.get("mcap_chg_24h") is not None:
+        st.write(f"Global mcap 24h: **{float(global_m['mcap_chg_24h']):+.2f}%**")
+    if fees:
+        st.write(f"BTC fee (fast): **{fees.get('fastestFee', '—')}** sat/vB")
+    if trending:
+        st.write("Trending: " + ", ".join(trending[:5]))
 
-st.subheader("Checklist (why buy / wait)")
+st.subheader("Checklist")
 for label, ok, detail in dec["checks"]:
-    mark = f"<span class='ok'>✓</span>" if ok else f"<span class='no'>✗</span>"
-    st.markdown(f"{mark} **{label}** — {detail}", unsafe_allow_html=True)
+    st.markdown(f"{'<span class=ok>✓</span>' if ok else '<span class=no>✗</span>'} **{label}** — {detail}", unsafe_allow_html=True)
 
 st.subheader("News")
 if news:
     for n in news[:6]:
-        title = n["title"]
-        link = n.get("link") or ""
-        if link:
-            st.markdown(f"- [{title}]({link})")
+        if n.get("link"):
+            st.markdown(f"- [{n['title']}]({n['link']})")
         else:
-            st.markdown(f"- {title}")
+            st.markdown(f"- {n['title']}")
 else:
-    st.caption("No headlines loaded (RSS may be blocked on this host).")
+    st.caption("No RSS headlines right now.")
 
 st.subheader("Price")
 chart_price(df)
 
-with st.expander("How this desk thinks"):
-    st.markdown("""
-**Spot only:** BUY = spend cash for coin · SELL = sell coin for cash · never short · no leverage.
+st.caption("Not financial advice · Live = polling refresh · Webhook optional for phone/Discord alerts")
 
-**Stack of information**
-1. **Exchange** — price, RSI, Bollinger, volume, higher-timeframe trend, funding sentiment  
-2. **Sentiment** — Crypto Fear & Greed  
-3. **Market** — CoinGecko global mcap change, BTC dominance  
-4. **Macro** — FRED 10Y yield, Fed funds, unemployment  
-5. **News** — recent headlines for awareness (not auto-trading on headlines)
-
-**Buy low** when enough checklist items pass and price is in a value zone.  
-**Sell high** when RSI/BB (and extreme greed) say expensive.
-
-This does **not** guarantee profit. Data can fail; news is lagged; you execute on your exchange.
-""")
-
-st.caption("Not financial advice · Public data only · No auto-orders")
+# Live feed loop (end of script)
+if live:
+    time.sleep(secs)
+    st.rerun()
