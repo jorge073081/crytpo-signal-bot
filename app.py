@@ -109,6 +109,19 @@ def binance_klines(symbol, interval, limit=250):
     return pd.DataFrame()
 
 
+
+@st.cache_data(ttl=10, show_spinner=False)
+def binance_ticker_price(symbol):
+    """Live last trade price (more current than last closed candle)."""
+    for host in BINANCE:
+        try:
+            r = requests.get(f"{host}/api/v3/ticker/price", params={"symbol": symbol}, timeout=8)
+            if r.status_code == 200:
+                return float(r.json()["price"])
+        except Exception:
+            continue
+    return None
+
 @st.cache_data(ttl=45, show_spinner=False)
 def binance_funding(symbol):
     for host in ["https://fapi.binance.com", "https://data-api.binance.vision"]:
@@ -418,6 +431,7 @@ else:
     st.caption(f"{interval} · {now.strftime('%Y-%m-%d %H:%M:%S')} UTC · turn on Live feed in sidebar")
 
 with st.spinner("Updating exchange · macro · sentiment · news…"):
+    live_px = binance_ticker_price(symbol)
     raw = binance_klines(symbol, interval, 250)
     htf_raw = binance_klines(symbol, HTF_MAP.get(interval, "1h"), 120)
     htf = trend_bias(htf_raw) if not htf_raw.empty else "RANGE"
@@ -447,6 +461,21 @@ if df.empty:
 last = df.iloc[-1]
 dec = trader_decision(last, htf, fng_val, fng_label, global_m, funding, ls_ratio, macro)
 
+# Use LIVE ticker for "now" and market entry (candle close can lag)
+if live_px is not None:
+    dec["price"] = live_px
+    if dec["action"] == "BUY":
+        # Market entry = live price; limit idea = buy zone if cheaper
+        dec["entry"] = live_px
+        atr = dec["atr"]
+        stop = min(live_px - 1.5 * atr, float(last["Swing_low"]) * 0.998)
+        risk = max(live_px - stop, atr * 0.5)
+        dec["stop"] = stop
+        dec["exit"] = live_px + 2.0 * risk  # sell target ABOVE entry
+        dec["limit_buy"] = float(last["BB_l"])  # optional limit below market
+    elif dec["action"] == "SELL":
+        dec["exit"] = live_px  # sell at live market
+
 # ── Alerts on signal change ───────────────────────────────────
 prev = st.session_state.get("last_action")
 action = dec["action"]
@@ -458,7 +487,7 @@ if alert_on and action in ("BUY", "SELL"):
         f"RSI {dec['rsi']:.0f} · HTF {htf} · {now.strftime('%H:%M UTC')}"
     )
     if action == "BUY":
-        st.markdown(f"<div class='alert-buy'>🔔 BUY ALERT — Entry {fmt(dec['entry'])} · Exit target {fmt(dec['exit'])}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='alert-buy'>🔔 BUY ALERT — Buy at {fmt(dec['entry'])} (market) · Sell target {fmt(dec['exit'])}</div>", unsafe_allow_html=True)
     else:
         st.markdown(f"<div class='alert-sell'>🔔 SELL ALERT — Exit {fmt(dec['exit'])} (sell coin for cash)</div>", unsafe_allow_html=True)
 
@@ -481,13 +510,22 @@ if action == "BUY" and dec.get("stop") and dec.get("entry"):
 
 # ── Main decision card ────────────────────────────────────────
 if action == "BUY":
+    limit_b = dec.get("limit_buy")
+    limit_line = f"<p class=\"small\">Optional limit buy (below market): {fmt(limit_b)}</p>" if limit_b and limit_b < dec["entry"] else ""
     st.markdown(
         f"""
         <div class="card">
-          <div class="small">SPOT DECISION</div>
+          <div class="small">SPOT DECISION · prices are live ticker</div>
           <div class="big buy">BUY</div>
-          <p style="font-size:1.2rem;margin-top:0.8rem"><b>Entry price</b><br><span class="big buy">{fmt(dec['entry'])}</span></p>
-          <p style="font-size:1.2rem"><b>Exit price</b><br><span class="big sell">{fmt(dec['exit'])}</span></p>
+          <p style="font-size:1.15rem;margin-top:0.8rem">
+            <b>Entry</b> = buy here (current market)<br>
+            <span class="big buy">{fmt(dec['entry'])}</span>
+          </p>
+          <p style="font-size:1.15rem">
+            <b>Exit target</b> = sell later for profit (above entry)<br>
+            <span class="big sell">{fmt(dec['exit'])}</span>
+          </p>
+          {limit_line}
           <p class="small">Stop {fmt(dec['stop'])} · Size ≈ {size:.6g} · Checklist {dec['votes']}/{dec['total']}</p>
         </div>
         """,
