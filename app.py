@@ -251,18 +251,25 @@ def technicals(df):
     d["EMA50"] = ema(c, 50) if len(d) >= 50 else ema(c, max(20, len(d) // 3))
     d["RSI"] = rsi(c)
     d["ATR"] = atr_s(d)
+    # ATR as % of price — high = chaotic tape
+    d["ATR_pct"] = (d["ATR"] / c.replace(0, np.nan)) * 100
     mid, std = c.rolling(20).mean(), c.rolling(20).std()
     d["BB_u"], d["BB_l"] = mid + 2 * std, mid - 2 * std
     d["BB_pct"] = (c - d["BB_l"]) / (d["BB_u"] - d["BB_l"]).replace(0, np.nan)
+    # BB bandwidth (squeeze when narrow vs its own history)
+    d["BB_width"] = (d["BB_u"] - d["BB_l"]) / mid.replace(0, np.nan)
+    width_med = d["BB_width"].rolling(50, min_periods=20).median()
+    d["BB_squeeze"] = d["BB_width"] < (width_med * 0.75)
     d["Swing_low"] = d["Low"].rolling(20).min()
     d["Swing_high"] = d["High"].rolling(20).max()
     d["Vol_MA"] = d["Volume"].rolling(20).mean()
     d["Vol_ratio"] = d["Volume"] / d["Vol_MA"].replace(0, np.nan)
-    # momentum turning up from low (helps avoid pure falling knives)
     d["RSI_rising"] = d["RSI"] > d["RSI"].shift(2)
     d["MACD"] = d["EMA12"] - d["EMA26"]
     d["MACD_sig"] = ema(d["MACD"], 9)
     d["MACD_up"] = d["MACD"] > d["MACD_sig"]
+    # recent return for relative strength vs BTC
+    d["ret_6"] = c.pct_change(6)
     return d.dropna()
 
 
@@ -277,7 +284,7 @@ def load_macro(fred_key):
     return {"DGS10": dgs10, "FEDFUNDS": fed, "UNRATE": unrate}
 
 
-def decide(last, htf, fng_val, fng_label, global_m, macro):
+def decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=None):
     """
     Stricter spot decision engine.
     - Required: value (BB or RSI) + HTF not DOWN
@@ -294,6 +301,8 @@ def decide(last, htf, fng_val, fng_label, global_m, macro):
     vol_ratio = float(last.get("Vol_ratio") or 1)
     rsi_rising = bool(last.get("RSI_rising", False))
     macd_up = bool(last.get("MACD_up", False))
+    atr_pct = float(last["ATR_pct"]) if pd.notna(last.get("ATR_pct")) else None
+    bb_squeeze = bool(last.get("BB_squeeze", False))
 
     stop = min(price - 1.5 * atr, float(last["Swing_low"]) * 0.998)
     risk = max(price - stop, atr * 0.4)
@@ -309,10 +318,12 @@ def decide(last, htf, fng_val, fng_label, global_m, macro):
     htf_ok = htf in ("UP", "RANGE")
     factors.append(("HTF allows buys (not DOWN)", 3.0, htf_ok, f"HTF={htf}"))
 
-    # avoid catching knives: want some turn OR range with deep oversold
+    # avoid catching knives; under BB squeeze demand a clearer turn
     turn_ok = rsi_rising or macd_up or (rsi_v < 28 and htf == "RANGE")
+    if bb_squeeze:
+        turn_ok = (rsi_rising and macd_up) or (rsi_rising and rsi_v < 30)
     factors.append(("Momentum not still collapsing", 2.0, turn_ok,
-                    f"RSI rising={rsi_rising} MACD up={macd_up}"))
+                    f"RSI↑={rsi_rising} MACD↑={macd_up}" + (" · squeeze" if bb_squeeze else "")))
 
     # --- IMPORTANT ---
     factors.append(("RSI not overbought", 1.5, rsi_v < 60, f"RSI {rsi_v:.0f}"))
@@ -321,6 +332,26 @@ def decide(last, htf, fng_val, fng_label, global_m, macro):
 
     # volume: very dead tape is a soft negative, not a hard fail
     factors.append(("Volume not dead", 1.0, vol_ratio >= 0.45, f"{vol_ratio:.1f}x MA"))
+
+    # --- ATR% volatility filter ---
+    if atr_pct is not None:
+        # typical crypto 15m-1h: block extreme chaos (tune by TF loosely)
+        atr_ok = atr_pct < 4.5  # >~4.5% ATR/price = very wild for entries
+        factors.append(("Volatility not extreme (ATR%)", 2.0, atr_ok, f"ATR% {atr_pct:.2f}"))
+
+    # --- BB squeeze: informational + soft weight; hard require is in turn_ok ---
+    factors.append(
+        ("BB squeeze handled", 1.0, (not bb_squeeze) or turn_ok,
+         "Squeeze ON — need stronger turn" if bb_squeeze else "No squeeze")
+    )
+
+    # --- vs BTC relative strength (alts only; BTC vs self skipped) ---
+    if rel_vs_btc is not None:
+        # rel_vs_btc = coin_ret - btc_ret over same window; negative = weaker than BTC
+        vs_ok = rel_vs_btc > -0.03  # not underperforming BTC by >3% on short window
+        factors.append(
+            ("Not much weaker than BTC", 2.0, vs_ok, f"vs BTC {rel_vs_btc*100:+.1f}%")
+        )
 
     # --- CONTEXT (only if data exists) ---
     if fng_val is not None:
@@ -349,6 +380,10 @@ def decide(last, htf, fng_val, fng_label, global_m, macro):
         hard_block.append("Extreme greed + not cheap")
     if global_m.get("mcap_chg_24h") is not None and float(global_m["mcap_chg_24h"]) <= -8:
         hard_block.append("Severe risk-off day (mcap)")
+    if atr_pct is not None and atr_pct >= 6.0:
+        hard_block.append(f"ATR% too high ({atr_pct:.2f}) — wait for calmer tape")
+    if bb_squeeze and not turn_ok:
+        hard_block.append("BB squeeze without momentum turn")
 
     # SELL HIGH: take profit / exit zone for holders
     sell_high = (
@@ -399,6 +434,9 @@ def decide(last, htf, fng_val, fng_label, global_m, macro):
         "rsi": rsi_v,
         "bb": bb,
         "atr": atr,
+        "atr_pct": atr_pct,
+        "bb_squeeze": bb_squeeze,
+        "rel_vs_btc": rel_vs_btc,
         "price": price,
     }
 
@@ -470,6 +508,10 @@ with st.spinner("Analyzing…"):
     global_m = coingecko_global()
     macro = load_macro(fred_key)
     news = news_headlines(name if name.replace(" ", "").isalpha() else "crypto", 6)
+    # BTC same timeframe for relative strength (skip if symbol is BTC)
+    btc_raw = pd.DataFrame()
+    if symbol != "BTCUSDT":
+        btc_raw = binance_klines("BTCUSDT", interval, 80)
 
 if raw.empty:
     st.error("No price data.")
@@ -481,7 +523,19 @@ if df.empty:
     st.stop()
 
 last = df.iloc[-1]
-dec = decide(last, htf, fng_val, fng_label, global_m, macro)
+# Relative strength vs BTC over ~6 bars
+rel_vs_btc = None
+if symbol != "BTCUSDT" and not btc_raw.empty and "ret_6" in df.columns:
+    try:
+        btc_t = technicals(btc_raw)
+        if not btc_t.empty and "ret_6" in btc_t.columns:
+            coin_r = float(last["ret_6"]) if pd.notna(last["ret_6"]) else None
+            btc_r = float(btc_t.iloc[-1]["ret_6"]) if pd.notna(btc_t.iloc[-1]["ret_6"]) else None
+            if coin_r is not None and btc_r is not None:
+                rel_vs_btc = coin_r - btc_r
+    except Exception:
+        rel_vs_btc = None
+dec = decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=rel_vs_btc)
 
 # Live price for entry/exit display
 if live_px is not None:
@@ -594,6 +648,13 @@ col_a, col_b = st.columns(2)
 with col_a:
     st.subheader("Context")
     st.write(f"BB position: **{dec['bb']*100:.0f}%** · ATR: **{fmt(dec['atr'])}**")
+    if dec.get("atr_pct") is not None:
+        st.write(f"ATR%: **{dec['atr_pct']:.2f}%**" + (" ⚠️ high" if dec["atr_pct"] >= 4.5 else ""))
+    st.write(f"BB squeeze: **{'YES — need turn' if dec.get('bb_squeeze') else 'No'}**")
+    if dec.get("rel_vs_btc") is not None:
+        st.write(f"vs BTC (6 bars): **{dec['rel_vs_btc']*100:+.1f}%**")
+    elif symbol == "BTCUSDT":
+        st.write("vs BTC: n/a (this is BTC)")
     if global_m.get("mcap_chg_24h") is not None:
         st.write(f"Global mcap 24h: **{float(global_m['mcap_chg_24h']):+.2f}%**")
     if global_m.get("btc_dom") is not None:
@@ -620,9 +681,12 @@ with st.expander("How decisions are made"):
 
 **BUY only if**
 - Price is in a **value** zone (low BB or low RSI)
-- Higher timeframe is **not DOWN** (or very deep oversold exception is limited)
+- Higher timeframe is **not DOWN**
 - Weighted score is strong (~62%+ of available points)
-- No hard block (extreme greed + expensive, or severe market crash)
+- **ATR%** not extreme (hard block if ATR% ≥ 6)
+- **BB squeeze** only with a real momentum turn
+- **vs BTC** not much weaker (alts)
+- No hard block (greed + expensive, crash day, etc.)
 
 **SELL when** RSI/BB (and sometimes greed) say **expensive** — for people who already hold the coin.
 
