@@ -204,6 +204,67 @@ def news_headlines(query="cryptocurrency", limit=6):
     return items[:limit]
 
 
+def score_news(headlines):
+    """
+    Rule-based safety layer. Returns dict:
+      score: -1..+1 (avg), label, n, hits
+    Strongly negative → hard-block buys.
+    """
+    if not headlines:
+        return {"score": None, "label": "no data", "n": 0, "hits": []}
+
+    neg = [
+        "hack", "hacked", "exploit", "exploited", "breach", "stolen", "drain",
+        "sec charges", "sec sues", "lawsuit", "indictment", "arrest",
+        "ban", "banned", "crackdown", "illegal", "fraud", "ponzi",
+        "insolvent", "insolvency", "bankrupt", "bankruptcy", "default",
+        "collapse", "crash", "liquidation cascade", "delist", "delisted",
+        "halt", "halted", "outage", "insolven", "rug pull", "rugpull",
+        "scandal", "investigation", "probe", "subpoena",
+        "terror", "war", "sanctions", "seizure", "freeze",
+        "depeg", "de-peg", "run on", "contagion",
+    ]
+    pos = [
+        "etf approved", "etf approval", "approved etf",
+        "partnership", "partners with", "integrates", "integration",
+        "upgrade", "mainnet", "launch", "all-time high", "ath ",
+        "record inflow", "inflows", "institutional", "adoption",
+        "bullish", "surge", "rally", "breakthrough",
+    ]
+
+    scores = []
+    hits = []
+    for h in headlines:
+        title = (h.get("title") or "").lower()
+        s = 0.0
+        matched = []
+        for w in neg:
+            if w in title:
+                s -= 1.0
+                matched.append("-" + w)
+        for w in pos:
+            if w in title:
+                s += 0.6
+                matched.append("+" + w)
+        # clamp per headline
+        s = max(-1.0, min(1.0, s))
+        scores.append(s)
+        if matched:
+            hits.append((h.get("title", "")[:90], s, matched[:4]))
+
+    avg = sum(scores) / len(scores) if scores else 0.0
+    if avg <= -0.35:
+        label = "TOXIC"
+    elif avg <= -0.12:
+        label = "NEGATIVE"
+    elif avg >= 0.25:
+        label = "POSITIVE"
+    else:
+        label = "NEUTRAL"
+
+    return {"score": round(avg, 3), "label": label, "n": len(scores), "hits": hits[:5]}
+
+
 def send_webhook(url, content):
     if not url or not url.startswith("http"):
         return False
@@ -284,7 +345,7 @@ def load_macro(fred_key):
     return {"DGS10": dgs10, "FEDFUNDS": fed, "UNRATE": unrate}
 
 
-def decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=None):
+def decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=None, news_sent=None):
     """
     Stricter spot decision engine.
     - Required: value (BB or RSI) + HTF not DOWN
@@ -367,6 +428,16 @@ def decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=None):
     if macro.get("DGS10") is not None:
         factors.append(("Yields not in spike panic zone", 1.0, macro["DGS10"] < 5.75, f"10Y {macro['DGS10']:.2f}%"))
 
+    # --- News safety layer ---
+    if news_sent and news_sent.get("score") is not None:
+        ns = float(news_sent["score"])
+        lab = news_sent.get("label", "")
+        # pass if not clearly negative
+        news_ok = ns > -0.12
+        factors.append(
+            ("News not toxic", 2.5, news_ok, f"{lab} ({ns:+.2f}) from {news_sent.get('n', 0)} headlines")
+        )
+
     # Score
     score = sum(w for _, w, ok, _ in factors if ok)
     max_score = sum(w for _, w, _, _ in factors)
@@ -384,6 +455,9 @@ def decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=None):
         hard_block.append(f"ATR% too high ({atr_pct:.2f}) — wait for calmer tape")
     if bb_squeeze and not turn_ok:
         hard_block.append("BB squeeze without momentum turn")
+    if news_sent and news_sent.get("score") is not None:
+        if float(news_sent["score"]) <= -0.35 or news_sent.get("label") == "TOXIC":
+            hard_block.append(f"Toxic news sentiment ({news_sent.get('label')})")
 
     # SELL HIGH: take profit / exit zone for holders
     sell_high = (
@@ -437,6 +511,7 @@ def decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=None):
         "atr_pct": atr_pct,
         "bb_squeeze": bb_squeeze,
         "rel_vs_btc": rel_vs_btc,
+        "news_sent": news_sent,
         "price": price,
     }
 
@@ -507,7 +582,8 @@ with st.spinner("Analyzing…"):
     fng_val, fng_label = fear_greed()
     global_m = coingecko_global()
     macro = load_macro(fred_key)
-    news = news_headlines(name if name.replace(" ", "").isalpha() else "crypto", 6)
+    news = news_headlines(name if name.replace(" ", "").isalpha() else "crypto", 8)
+    news_sent = score_news(news)
     # BTC same timeframe for relative strength (skip if symbol is BTC)
     btc_raw = pd.DataFrame()
     if symbol != "BTCUSDT":
@@ -535,7 +611,7 @@ if symbol != "BTCUSDT" and not btc_raw.empty and "ret_6" in df.columns:
                 rel_vs_btc = coin_r - btc_r
     except Exception:
         rel_vs_btc = None
-dec = decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=rel_vs_btc)
+dec = decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=rel_vs_btc, news_sent=news_sent)
 
 # Live price for entry/exit display
 if live_px is not None:
@@ -665,7 +741,26 @@ with col_b:
     st.write(f"Fed/short: **{macro['FEDFUNDS']:.2f}%**" if macro.get("FEDFUNDS") is not None else "Fed/short: —")
     st.write(f"Unemployment: **{macro['UNRATE']:.2f}%**" if macro.get("UNRATE") is not None else "Unemployment: —")
 
-st.subheader("News")
+st.subheader("News sentiment (safety layer)")
+if news_sent and news_sent.get("score") is not None:
+    lab = news_sent["label"]
+    sc = news_sent["score"]
+    if lab == "TOXIC":
+        st.error(f"**{lab}** · score {sc:+.2f} · BUYs blocked until headlines cool off")
+    elif lab == "NEGATIVE":
+        st.warning(f"**{lab}** · score {sc:+.2f} · checklist penalty")
+    elif lab == "POSITIVE":
+        st.success(f"**{lab}** · score {sc:+.2f} · does not force a BUY")
+    else:
+        st.info(f"**{lab}** · score {sc:+.2f}")
+    if news_sent.get("hits"):
+        with st.expander("Matched headlines"):
+            for title, s, matched in news_sent["hits"]:
+                st.caption(f"({s:+.1f}) {title}")
+else:
+    st.caption("No news score (feed empty).")
+
+st.subheader("Headlines")
 if news:
     for n in news:
         st.markdown(f"- [{n['title']}]({n['link']})" if n.get("link") else f"- {n['title']}")
@@ -686,7 +781,8 @@ with st.expander("How decisions are made"):
 - **ATR%** not extreme (hard block if ATR% ≥ 6)
 - **BB squeeze** only with a real momentum turn
 - **vs BTC** not much weaker (alts)
-- No hard block (greed + expensive, crash day, etc.)
+- **News** not toxic (rule-based headline score)
+- No hard block (greed + expensive, crash day, toxic news, etc.)
 
 **SELL when** RSI/BB (and sometimes greed) say **expensive** — for people who already hold the coin.
 
