@@ -1,15 +1,10 @@
 """
-Crypto Spot Desk — Buy Low / Sell High + Live feed + Alerts
-===========================================================
-Spot only. No shorts. No leverage. No learning module.
+Crypto Spot Desk — max public context + FRED API key support
+============================================================
+Spot only. Entry / Exit. Live feed. Alerts.
 
-Data (public):
-  Binance price/volume/funding/OI/long-short
-  Fear & Greed, CoinGecko global + trending
-  FRED macro, RSS news, mempool (BTC)
-
-Live feed: optional auto-refresh
-Alerts: on-screen + toast + optional webhook (Discord/Telegram URL)
+FRED: set secret FRED_API_KEY in Streamlit Cloud (or env FRED_API_KEY).
+Never commit the key to GitHub.
 
 Not financial advice. Not guaranteed profit.
 """
@@ -18,41 +13,36 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import requests
 import time
 import xml.etree.ElementTree as ET
 from io import StringIO
-import json
+import os
 
 st.set_page_config(page_title="Spot Desk · Live", page_icon="⚡", layout="wide")
 
 st.markdown("""
 <style>
 .big { font-size: 1.85rem; font-weight: 800; margin: 0.15rem 0; }
-.buy { color: #00c853; }
-.sell { color: #ffab00; }
-.wait { color: #90a4ae; }
+.buy { color: #00c853; } .sell { color: #ffab00; } .wait { color: #90a4ae; }
 .card {
   background: rgba(255,255,255,0.05);
   border: 1px solid rgba(255,255,255,0.12);
-  border-radius: 12px;
-  padding: 1.2rem 1.4rem;
-  margin-bottom: 0.6rem;
+  border-radius: 12px; padding: 1.2rem 1.4rem; margin-bottom: 0.6rem;
 }
 .alert-buy {
-  background: rgba(0,200,83,0.18);
-  border-left: 5px solid #00c853;
+  background: rgba(0,200,83,0.18); border-left: 5px solid #00c853;
   padding: 12px 16px; border-radius: 8px; font-weight: 700; margin: 8px 0;
 }
 .alert-sell {
-  background: rgba(255,171,0,0.18);
-  border-left: 5px solid #ffab00;
+  background: rgba(255,171,0,0.18); border-left: 5px solid #ffab00;
   padding: 12px 16px; border-radius: 8px; font-weight: 700; margin: 8px 0;
 }
 .ok { color: #00c853; } .no { color: #ff5252; }
 .small { color: #9e9e9e; font-size: 0.88rem; }
 .live-dot { color: #ff1744; font-weight: 800; }
+.health-ok { color: #00c853; } .health-bad { color: #ff5252; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -71,6 +61,17 @@ HTF_MAP = {"15m": "1h", "30m": "4h", "1h": "4h", "4h": "1d", "1d": "1d"}
 BINANCE = ["https://data-api.binance.vision", "https://api.binance.us"]
 
 
+def get_fred_key():
+    # Streamlit secrets first, then env — never hardcode
+    try:
+        k = st.secrets.get("FRED_API_KEY", None)
+        if k:
+            return str(k).strip()
+    except Exception:
+        pass
+    return os.environ.get("FRED_API_KEY", "").strip() or None
+
+
 def fmt(x):
     if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
         return "—"
@@ -82,6 +83,18 @@ def fmt(x):
     if abs(x) < 100:
         return f"${x:.3f}"
     return f"${x:,.2f}"
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def binance_ticker_price(symbol):
+    for host in BINANCE:
+        try:
+            r = requests.get(f"{host}/api/v3/ticker/price", params={"symbol": symbol}, timeout=8)
+            if r.status_code == 200:
+                return float(r.json()["price"])
+        except Exception:
+            continue
+    return None
 
 
 @st.cache_data(ttl=20, show_spinner=False)
@@ -109,22 +122,9 @@ def binance_klines(symbol, interval, limit=250):
     return pd.DataFrame()
 
 
-
-@st.cache_data(ttl=10, show_spinner=False)
-def binance_ticker_price(symbol):
-    """Live last trade price (more current than last closed candle)."""
-    for host in BINANCE:
-        try:
-            r = requests.get(f"{host}/api/v3/ticker/price", params={"symbol": symbol}, timeout=8)
-            if r.status_code == 200:
-                return float(r.json()["price"])
-        except Exception:
-            continue
-    return None
-
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def binance_funding(symbol):
-    for host in ["https://fapi.binance.com", "https://data-api.binance.vision"]:
+    for host in ["https://fapi.binance.com", "https://api.binance.us"]:
         try:
             r = requests.get(f"{host}/fapi/v1/fundingRate", params={"symbol": symbol, "limit": 2}, timeout=8)
             if r.status_code == 200 and r.json():
@@ -134,21 +134,19 @@ def binance_funding(symbol):
     return None
 
 
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def binance_oi(symbol):
-    for host in ["https://fapi.binance.com"]:
-        try:
-            r = requests.get(f"{host}/fapi/v1/openInterest", params={"symbol": symbol}, timeout=8)
-            if r.status_code == 200:
-                return float(r.json().get("openInterest", 0))
-        except Exception:
-            continue
+    try:
+        r = requests.get("https://fapi.binance.com/fapi/v1/openInterest", params={"symbol": symbol}, timeout=8)
+        if r.status_code == 200:
+            return float(r.json().get("openInterest", 0))
+    except Exception:
+        pass
     return None
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def binance_long_short(symbol):
-    """Global long/short account ratio (futures sentiment)."""
     try:
         r = requests.get(
             "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
@@ -157,10 +155,10 @@ def binance_long_short(symbol):
         )
         if r.status_code == 200 and r.json():
             row = r.json()[-1]
-            return float(row.get("longShortRatio", 0)), float(row.get("longAccount", 0)), float(row.get("shortAccount", 0))
+            return float(row.get("longShortRatio", 0))
     except Exception:
         pass
-    return None, None, None
+    return None
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -195,18 +193,42 @@ def coingecko_trending():
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fred_last(series_id):
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+def fred_series(series_id: str, api_key: str):
+    """Official FRED API — requires free API key."""
+    if not api_key:
+        return None
     try:
-        r = requests.get(url, timeout=12, headers={"User-Agent": "SpotDesk/1.0"})
+        r = requests.get(
+            "https://api.stlouisfed.org/fred/series/observations",
+            params={
+                "series_id": series_id,
+                "api_key": api_key,
+                "file_type": "json",
+                "sort_order": "desc",
+                "limit": 5,
+            },
+            timeout=12,
+        )
         if r.status_code != 200:
             return None
-        df = pd.read_csv(StringIO(r.text)).replace(".", np.nan).dropna()
-        if df.empty or len(df.columns) < 2:
+        obs = r.json().get("observations", [])
+        for o in obs:
+            if o.get("value") not in (None, "."):
+                return float(o["value"])
+    except Exception:
+        return None
+    return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def yahoo_last(symbol: str):
+    """Fallback yields if FRED key missing."""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=5d&interval=1d"
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
             return None
-        df.iloc[:, 1] = pd.to_numeric(df.iloc[:, 1], errors="coerce")
-        df = df.dropna()
-        return float(df.iloc[-1, 1])
+        return float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
     except Exception:
         return None
 
@@ -251,11 +273,9 @@ def send_webhook(url: str, content: str):
     if not url or not url.startswith("http"):
         return False
     try:
-        # Discord-style
         r = requests.post(url, json={"content": content}, timeout=8)
         if r.status_code < 300:
             return True
-        # Telegram bot style: user pastes full API URL sometimes
         r2 = requests.post(url, json={"text": content}, timeout=8)
         return r2.status_code < 300
     except Exception:
@@ -307,6 +327,33 @@ def technicals(df):
     return d.dropna()
 
 
+def load_macro(fred_key):
+    """FRED API when key present; Yahoo fallback for yields."""
+    src = {}
+    dgs10 = fed = unrate = None
+    if fred_key:
+        dgs10 = fred_series("DGS10", fred_key)
+        fed = fred_series("FEDFUNDS", fred_key)
+        unrate = fred_series("UNRATE", fred_key)
+        src["fred"] = bool(dgs10 or fed or unrate)
+    if dgs10 is None:
+        dgs10 = yahoo_last("^TNX")
+        if dgs10:
+            src["dgs10"] = "Yahoo ^TNX"
+    else:
+        src["dgs10"] = "FRED"
+    if fed is None:
+        # 13-week bill as short-rate proxy
+        fed = yahoo_last("^IRX")
+        if fed:
+            src["fed"] = "Yahoo ^IRX"
+    else:
+        src["fed"] = "FRED"
+    if unrate is not None:
+        src["unrate"] = "FRED"
+    return {"DGS10": dgs10, "FEDFUNDS": fed, "UNRATE": unrate, "_src": src}
+
+
 def trader_decision(last, htf, fng_val, fng_label, global_m, funding, ls_ratio, macro):
     price = float(last["Close"])
     rsi_v = float(last["RSI"])
@@ -333,7 +380,6 @@ def trader_decision(last, htf, fng_val, fng_label, global_m, funding, ls_ratio, 
     if funding is not None:
         checks.append(("Funding not overheated", funding < 0.0005, f"{funding*100:.4f}%"))
     if ls_ratio is not None:
-        # very high long ratio = crowded longs = caution on new buys
         checks.append(("Longs not extremely crowded", ls_ratio < 2.2, f"L/S {ls_ratio:.2f}"))
     if global_m.get("mcap_chg_24h") is not None:
         chg = float(global_m["mcap_chg_24h"])
@@ -362,6 +408,7 @@ def trader_decision(last, htf, fng_val, fng_label, global_m, funding, ls_ratio, 
         "stop": stop,
         "buy_zone": float(last["BB_l"]),
         "sell_zone": float(last["BB_u"]),
+        "limit_buy": float(last["BB_l"]),
         "checks": checks,
         "votes": votes,
         "total": total,
@@ -390,6 +437,8 @@ def chart_price(df):
 
 
 # ── Sidebar ───────────────────────────────────────────────────
+fred_key = get_fred_key()
+
 st.sidebar.title("Spot Desk")
 name = st.sidebar.selectbox("Coin", list(CRYPTO.keys()), index=0)
 symbol = CRYPTO[name]
@@ -410,27 +459,30 @@ secs = st.sidebar.slider("Seconds between updates", 15, 120, 30)
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔔 Alerts")
 alert_on = st.sidebar.checkbox("Alert on BUY / SELL", value=True)
-webhook = st.sidebar.text_input(
-    "Webhook URL (optional)",
-    placeholder="Discord webhook or similar",
-    help="Posts a message when signal flips to BUY or SELL",
-)
+webhook = st.sidebar.text_input("Webhook URL (optional)", placeholder="Discord webhook")
+
+st.sidebar.markdown("---")
+if fred_key:
+    st.sidebar.success("FRED API key loaded")
+else:
+    st.sidebar.warning("No FRED key — add secret FRED_API_KEY")
 
 if st.sidebar.button("Refresh now"):
     st.cache_data.clear()
     st.rerun()
 
-st.sidebar.caption("Spot only · public data · you place orders")
-
-# ── Load ──────────────────────────────────────────────────────
+# ── Load all feeds ────────────────────────────────────────────
 now = datetime.now(timezone.utc)
 st.title(f"{name}")
 if live:
-    st.markdown(f"<span class='live-dot'>● LIVE</span> · {interval} · {now.strftime('%H:%M:%S')} UTC · refresh every {secs}s", unsafe_allow_html=True)
+    st.markdown(
+        f"<span class='live-dot'>● LIVE</span> · {interval} · {now.strftime('%H:%M:%S')} UTC · every {secs}s",
+        unsafe_allow_html=True,
+    )
 else:
-    st.caption(f"{interval} · {now.strftime('%Y-%m-%d %H:%M:%S')} UTC · turn on Live feed in sidebar")
+    st.caption(f"{interval} · {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
-with st.spinner("Updating exchange · macro · sentiment · news…"):
+with st.spinner("Loading exchange · FRED · sentiment · news…"):
     live_px = binance_ticker_price(symbol)
     raw = binance_klines(symbol, interval, 250)
     htf_raw = binance_klines(symbol, HTF_MAP.get(interval, "1h"), 120)
@@ -440,92 +492,91 @@ with st.spinner("Updating exchange · macro · sentiment · news…"):
     trending = coingecko_trending()
     funding = binance_funding(symbol)
     oi = binance_oi(symbol)
-    ls_ratio, long_acc, short_acc = binance_long_short(symbol)
-    macro = {
-        "DGS10": fred_last("DGS10"),
-        "FEDFUNDS": fred_last("FEDFUNDS"),
-        "UNRATE": fred_last("UNRATE"),
-    }
+    ls_ratio = binance_long_short(symbol)
+    macro = load_macro(fred_key)
     fees = mempool_fees() if "BTC" in symbol else {}
     news = news_headlines(name if name.replace(" ", "").isalpha() else "crypto", 8)
 
+# Data health
+health = {
+    "Price": live_px is not None or not raw.empty,
+    "Candles": not raw.empty,
+    "Fear&Greed": fng_val is not None,
+    "CoinGecko": bool(global_m),
+    "FRED/Macro": macro.get("DGS10") is not None or macro.get("FEDFUNDS") is not None,
+    "Funding": funding is not None,
+    "News": bool(news),
+}
+
 if raw.empty:
-    st.error("No price data from exchange.")
+    st.error("No exchange candles. Try Refresh or another pair.")
     st.stop()
 
 df = technicals(raw)
 if df.empty:
-    st.error("Not enough candles.")
+    st.error("Not enough bars.")
     st.stop()
 
 last = df.iloc[-1]
 dec = trader_decision(last, htf, fng_val, fng_label, global_m, funding, ls_ratio, macro)
 
-# Use LIVE ticker for "now" and market entry (candle close can lag)
 if live_px is not None:
     dec["price"] = live_px
     if dec["action"] == "BUY":
-        # Market entry = live price; limit idea = buy zone if cheaper
         dec["entry"] = live_px
         atr = dec["atr"]
         stop = min(live_px - 1.5 * atr, float(last["Swing_low"]) * 0.998)
         risk = max(live_px - stop, atr * 0.5)
         dec["stop"] = stop
-        dec["exit"] = live_px + 2.0 * risk  # sell target ABOVE entry
-        dec["limit_buy"] = float(last["BB_l"])  # optional limit below market
+        dec["exit"] = live_px + 2.0 * risk
     elif dec["action"] == "SELL":
-        dec["exit"] = live_px  # sell at live market
+        dec["exit"] = live_px
 
-# ── Alerts on signal change ───────────────────────────────────
-prev = st.session_state.get("last_action")
 action = dec["action"]
-if alert_on and action in ("BUY", "SELL"):
-    msg = (
-        f"{'🟢 BUY LOW' if action=='BUY' else '🟠 SELL HIGH'} {name} ({symbol})\n"
-        f"Price {fmt(dec['price'])}\n"
-        f"Entry {fmt(dec.get('entry'))} · Exit {fmt(dec.get('exit'))}\n"
-        f"RSI {dec['rsi']:.0f} · HTF {htf} · {now.strftime('%H:%M UTC')}"
-    )
-    if action == "BUY":
-        st.markdown(f"<div class='alert-buy'>🔔 BUY ALERT — Buy at {fmt(dec['entry'])} (market) · Sell target {fmt(dec['exit'])}</div>", unsafe_allow_html=True)
-    else:
-        st.markdown(f"<div class='alert-sell'>🔔 SELL ALERT — Exit {fmt(dec['exit'])} (sell coin for cash)</div>", unsafe_allow_html=True)
+prev = st.session_state.get("last_action")
 
+if alert_on and action in ("BUY", "SELL"):
+    if action == "BUY":
+        st.markdown(
+            f"<div class='alert-buy'>🔔 BUY ALERT — Buy at {fmt(dec['entry'])} (market) · Sell target {fmt(dec['exit'])}</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f"<div class='alert-sell'>🔔 SELL ALERT — Exit {fmt(dec['exit'])} (sell coin for cash)</div>",
+            unsafe_allow_html=True,
+        )
     if prev != action:
-        st.toast(f"{action} signal on {name}", icon="🔔")
+        st.toast(f"{action} on {name}", icon="🔔")
         if webhook.strip():
-            ok = send_webhook(webhook.strip(), msg)
-            if ok:
-                st.caption("Webhook alert sent.")
-            else:
-                st.caption("Webhook failed (check URL).")
+            msg = f"{action} {name} @ {fmt(dec['price'])} | entry {fmt(dec.get('entry'))} exit {fmt(dec.get('exit'))}"
+            send_webhook(webhook.strip(), msg)
 st.session_state["last_action"] = action
 
-# Size
 size = 0.0
 if action == "BUY" and dec.get("stop") and dec.get("entry"):
     risk_amt = dec["entry"] - dec["stop"]
     if risk_amt > 0:
         size = (account * risk_pct / 100.0) / risk_amt
 
-# ── Main decision card ────────────────────────────────────────
 if action == "BUY":
-    limit_b = dec.get("limit_buy")
-    limit_line = f"<p class=\"small\">Optional limit buy (below market): {fmt(limit_b)}</p>" if limit_b and limit_b < dec["entry"] else ""
+    lim = dec.get("limit_buy")
+    lim_html = (
+        f"<p class='small'>Optional limit (below market): {fmt(lim)}</p>"
+        if lim and lim < dec["entry"] else ""
+    )
     st.markdown(
         f"""
         <div class="card">
-          <div class="small">SPOT DECISION · prices are live ticker</div>
+          <div class="small">SPOT · live ticker</div>
           <div class="big buy">BUY</div>
           <p style="font-size:1.15rem;margin-top:0.8rem">
-            <b>Entry</b> = buy here (current market)<br>
-            <span class="big buy">{fmt(dec['entry'])}</span>
+            <b>Entry</b> (buy at market)<br><span class="big buy">{fmt(dec['entry'])}</span>
           </p>
           <p style="font-size:1.15rem">
-            <b>Exit target</b> = sell later for profit (above entry)<br>
-            <span class="big sell">{fmt(dec['exit'])}</span>
+            <b>Exit target</b> (sell later, above entry)<br><span class="big sell">{fmt(dec['exit'])}</span>
           </p>
-          {limit_line}
+          {lim_html}
           <p class="small">Stop {fmt(dec['stop'])} · Size ≈ {size:.6g} · Checklist {dec['votes']}/{dec['total']}</p>
         </div>
         """,
@@ -535,10 +586,12 @@ elif action == "SELL":
     st.markdown(
         f"""
         <div class="card">
-          <div class="small">SPOT DECISION</div>
+          <div class="small">SPOT · live ticker</div>
           <div class="big sell">SELL</div>
-          <p style="font-size:1.2rem;margin-top:0.8rem"><b>Exit price</b><br><span class="big sell">{fmt(dec['exit'])}</span></p>
-          <p class="small">Sell coin for cash. Next buy zone ≈ {fmt(dec['buy_zone'])}</p>
+          <p style="font-size:1.15rem;margin-top:0.8rem">
+            <b>Exit</b> (sell coin for cash)<br><span class="big sell">{fmt(dec['exit'])}</span>
+          </p>
+          <p class="small">Next buy zone ≈ {fmt(dec['buy_zone'])}</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -547,7 +600,7 @@ else:
     st.markdown(
         f"""
         <div class="card">
-          <div class="small">SPOT DECISION</div>
+          <div class="small">SPOT</div>
           <div class="big wait">WAIT</div>
           <p>Price <b>{fmt(dec['price'])}</b></p>
           <p>Buy zone ≈ {fmt(dec['buy_zone'])} · Sell zone ≈ {fmt(dec['sell_zone'])}</p>
@@ -569,44 +622,77 @@ a, b, c = st.columns(3)
 with a:
     st.subheader("Exchange")
     st.write(f"BB: **{dec['bb']*100:.0f}%** · ATR: **{fmt(dec['atr'])}**")
-    st.write(f"Funding: **{funding*100:.4f}%**" if funding is not None else "Funding: —")
-    st.write(f"Open interest: **{oi:,.0f}**" if oi else "OI: —")
-    if ls_ratio is not None:
-        st.write(f"Long/Short ratio: **{ls_ratio:.2f}**")
+    st.write(f"Funding: **{funding*100:.4f}%**" if funding is not None else "Funding: — *(futures blocked in region)*")
+    st.write(f"OI: **{oi:,.0f}**" if oi else "OI: —")
+    st.write(f"Long/Short: **{ls_ratio:.2f}**" if ls_ratio is not None else "Long/Short: —")
 with b:
-    st.subheader("Macro (FRED)")
-    st.write(f"10Y: **{macro['DGS10']:.2f}%**" if macro.get("DGS10") else "10Y: —")
-    st.write(f"Fed funds: **{macro['FEDFUNDS']:.2f}%**" if macro.get("FEDFUNDS") else "Fed: —")
-    st.write(f"Unemployment: **{macro['UNRATE']:.2f}%**" if macro.get("UNRATE") else "Unemp: —")
+    st.subheader("Macro")
+    src = macro.get("_src", {})
+    st.write(
+        f"10Y: **{macro['DGS10']:.2f}%**" + (f" · {src.get('dgs10','')}" if macro.get("DGS10") else " —")
+        if macro.get("DGS10") is not None else "10Y: —"
+    )
+    st.write(
+        f"Fed / short rate: **{macro['FEDFUNDS']:.2f}%**"
+        + (f" · {src.get('fed','')}" if macro.get("FEDFUNDS") else "")
+        if macro.get("FEDFUNDS") is not None else "Fed / short rate: —"
+    )
+    st.write(f"Unemployment: **{macro['UNRATE']:.2f}%**" if macro.get("UNRATE") is not None else "Unemployment: —")
+    if not fred_key:
+        st.caption("Add FRED_API_KEY in Streamlit secrets for full Fed data")
 with c:
     st.subheader("Market / chain")
     if global_m.get("mcap_chg_24h") is not None:
         st.write(f"Global mcap 24h: **{float(global_m['mcap_chg_24h']):+.2f}%**")
     if fees:
-        st.write(f"BTC fee (fast): **{fees.get('fastestFee', '—')}** sat/vB")
+        st.write(f"BTC fee fast: **{fees.get('fastestFee', '—')}** sat/vB")
     if trending:
         st.write("Trending: " + ", ".join(trending[:5]))
 
+st.subheader("Data health")
+cols = st.columns(len(health))
+for col, (k, ok) in zip(cols, health.items()):
+    col.markdown(
+        f"{'<span class=health-ok>●</span>' if ok else '<span class=health-bad>●</span>'} {k}",
+        unsafe_allow_html=True,
+    )
+
 st.subheader("Checklist")
 for label, ok, detail in dec["checks"]:
-    st.markdown(f"{'<span class=ok>✓</span>' if ok else '<span class=no>✗</span>'} **{label}** — {detail}", unsafe_allow_html=True)
+    st.markdown(
+        f"{'<span class=ok>✓</span>' if ok else '<span class=no>✗</span>'} **{label}** — {detail}",
+        unsafe_allow_html=True,
+    )
 
 st.subheader("News")
 if news:
     for n in news[:6]:
-        if n.get("link"):
-            st.markdown(f"- [{n['title']}]({n['link']})")
-        else:
-            st.markdown(f"- {n['title']}")
+        st.markdown(f"- [{n['title']}]({n['link']})" if n.get("link") else f"- {n['title']}")
 else:
-    st.caption("No RSS headlines right now.")
+    st.caption("No headlines loaded.")
 
 st.subheader("Price")
 chart_price(df)
 
-st.caption("Not financial advice · Live = polling refresh · Webhook optional for phone/Discord alerts")
+with st.expander("Add your FRED API key (Streamlit Cloud)"):
+    st.markdown("""
+1. Open [Streamlit Cloud](https://share.streamlit.io) → your app → **Settings** → **Secrets**
+2. Paste:
 
-# Live feed loop (end of script)
+```toml
+FRED_API_KEY = "your_key_here"
+```
+
+3. Save → reboot app  
+4. Sidebar should show **FRED API key loaded** and Macro numbers fill in  
+
+Get a free key: https://fred.stlouisfed.org/docs/api/api_key.html  
+
+**Do not** put the key in `app.py` or commit it to GitHub.
+""")
+
+st.caption("Not financial advice · Spot only · You place orders")
+
 if live:
     time.sleep(secs)
     st.rerun()
