@@ -1,9 +1,9 @@
 """
-Crypto Signal Bot Pro — LONG ONLY: Buy Low, Sell High
+Crypto Signal Bot Pro — SPOT ONLY: Buy Low, Sell High
 =====================================================
-• Only longs (no short selling)
-• Buy when price is low (RSI/BB/value) + filters allow
-• Sell high = close the long (TP / signal exit), not open a short
+• Spot only: cash → buy coin when low → sell coin when high → cash
+• No short selling
+• No leveraged positions — only owning the asset or cash (USDT)
 • Trade log + stats + optimize (Cloud: export/import CSV)
 
 Not financial advice. No live orders.
@@ -19,7 +19,7 @@ import requests
 import time
 import json
 
-st.set_page_config(page_title="Buy Low Sell High · Long Only", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Buy Low Sell High · Spot Only", page_icon="⚡", layout="wide")
 
 st.markdown("""
 <style>
@@ -115,7 +115,7 @@ def load_trades() -> pd.DataFrame:
     if not frames:
         return pd.DataFrame(columns=cols)
     df = pd.concat(frames, ignore_index=True)
-    # long only history
+    # spot only history
     if "side" in df.columns:
         df = df[df["side"].astype(str).str.upper().isin(["BUY", "LONG", "nan"]) | df["side"].isna()]
         df["side"] = "BUY"
@@ -202,7 +202,7 @@ def trend_bias(df: pd.DataFrame) -> str:
 
 
 def add_signals(df: pd.DataFrame, htf_bias: str, params: dict) -> pd.DataFrame:
-    """Long-only: BUY_LOW | SELL_HIGH (exit) | HOLD. Never opens a short."""
+    """Spot only: BUY_LOW | SELL_HIGH (sell coin) | HOLD. No shorts. No leverage."""
     if df.empty or len(df) < 40:
         return pd.DataFrame()
     d = df.copy()
@@ -237,7 +237,7 @@ def add_signals(df: pd.DataFrame, htf_bias: str, params: dict) -> pd.DataFrame:
     d["RSI_overbought"] = d["RSI"] > 65
     d["Vol_spike"] = d["Vol_ratio"] > 1.8
 
-    # Score: higher = better long entry (buy low)
+    # Score: higher = better spot buy (buy low)
     score = pd.Series(0.0, index=d.index)
     score += np.where(d["RSI"] < 25, 30, 0)
     score += np.where((d["RSI"] >= 25) & (d["RSI"] < 38), 18, 0)
@@ -263,11 +263,11 @@ def add_signals(df: pd.DataFrame, htf_bias: str, params: dict) -> pd.DataFrame:
     sell_rsi = float(params.get("sell_rsi_min", 62))
     sell_bb = float(params.get("sell_bb_min", 0.72))
 
-    # Block new longs in hard DOWN (buy low only when not catching a knife without HTF support)
+    # Block new buys in hard DOWN (don't catch knives without HTF support)
     allow_buy = htf_bias in ("UP", "RANGE")
 
     def classify(row):
-        # SELL_HIGH = exit signal for longs only (mark on chart / paper exit)
+        # SELL_HIGH = sell coin for cash (spot exit), never open a short
         sell_high = (
             float(row["RSI"]) >= sell_rsi
             or float(row["BB_pct"]) >= sell_bb
@@ -284,7 +284,7 @@ def add_signals(df: pd.DataFrame, htf_bias: str, params: dict) -> pd.DataFrame:
         if buy_low and not sell_high:
             return "BUY"
         if sell_high:
-            return "SELL_HIGH"  # close long / take profit — NOT a short
+            return "SELL_HIGH"  # sell spot inventory — NOT a short
         return "HOLD"
 
     d["Signal"] = d.apply(classify, axis=1)
@@ -304,7 +304,7 @@ def add_signals(df: pd.DataFrame, htf_bias: str, params: dict) -> pd.DataFrame:
 
 def confluence_checklist(row, htf_bias, min_rr):
     return [
-        ("HTF allows longs (UP or RANGE)", htf_bias in ("UP", "RANGE")),
+        ("HTF allows buys (UP or RANGE)", htf_bias in ("UP", "RANGE")),
         ("Not strong local downtrend", bool(row.get("Local_up") or row["EMA_fast"] >= row["EMA_slow"] * 0.997)),
         ("RSI in buy-low area (< 45)", float(row["RSI"]) < 45),
         ("Near value (BB% < 45)", float(row["BB_pct"]) < 0.45),
@@ -331,7 +331,7 @@ def build_plan(row, account_usd, risk_pct, min_rr):
 
 
 def simulate_longs(df, asset, symbol, interval, htf_bias, min_rr):
-    """Enter on BUY, exit on SELL_HIGH or stop. Long only."""
+    """Enter on BUY, exit on SELL_HIGH or stop. Spot only."""
     rows = []
     in_pos = False
     entry = entry_t = stop = None
@@ -385,7 +385,7 @@ def optimize_longs(trades: pd.DataFrame, current: dict) -> tuple[dict, str]:
         return current, "No trades yet."
     t = t[t["result"].isin(["WIN", "LOSS"])] if "result" in t.columns else t
     if len(t) < 12:
-        return current, f"Need ≥12 closed long trades (have {len(t)}). Keep using Single asset."
+        return current, f"Need ≥12 closed spot trades (have {len(t)}). Keep using Single asset."
 
     new_p = current.copy()
     notes = [f"n={len(t)} avg PnL%/trade={t['pnl_pct'].mean():+.2f}%"]
@@ -526,7 +526,7 @@ def snapshot(name, symbol, interval, params):
 # ── Sidebar ───────────────────────────────────────────────────
 params = load_params()
 st.sidebar.header("🛠️ Control Room")
-st.sidebar.success("Mode: **LONG ONLY** · Buy low → Sell high (exit)")
+st.sidebar.success("Mode: **SPOT ONLY** · Cash → buy coin low → sell high → cash")
 page = st.sidebar.radio("View", ["Single asset", "Multi-ticker scanner", "Learning lab"], index=0)
 interval = st.sidebar.selectbox("Candle size", INTERVALS, index=3)
 limit = st.sidebar.select_slider("Candles shown", options=[50, 100, 150, 200, 300], value=100)
@@ -557,15 +557,15 @@ st.sidebar.info("Cloud: Export trades in Learning lab after each session.")
 # LEARNING LAB
 # ══════════════════════════════════════════════════════════════
 if page == "Learning lab":
-    st.title("🧠 Learning lab · Long only")
-    st.caption("Learns better **buy low** entries and **sell high** exits from your paper long trades.")
+    st.title("🧠 Learning lab · Spot only")
+    st.caption("Learns better **buy low** entries and **sell high** exits from your paper spot trades.")
 
     log = load_trades()
     closed = log[log["result"].isin(["WIN", "LOSS"])] if not log.empty and "result" in log.columns else pd.DataFrame()
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Log rows", len(log))
-    m2.metric("Closed longs", len(closed))
+    m2.metric("Closed spot trades", len(closed))
     m3.metric("Win rate", f"{(closed['result']=='WIN').mean()*100:.0f}%" if len(closed) else "—")
 
     up = st.file_uploader("Import trades CSV", type=["csv"])
@@ -585,9 +585,9 @@ if page == "Learning lab":
         st.dataframe(log.sort_values("logged_at", ascending=False) if "logged_at" in log.columns else log,
                      use_container_width=True, height=260)
         st.download_button("⬇️ Export trades CSV", log.to_csv(index=False).encode(),
-                           f"long_trades_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv", "text/csv")
+                           f"spot_trades_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv", "text/csv")
     else:
-        st.info("No trades yet — open Single asset to paper-trade longs into the log.")
+        st.info("No trades yet — open Single asset to paper-trade spot round-trips into the log.")
 
     st.subheader("Stats")
     if closed.empty:
@@ -633,7 +633,7 @@ if page == "Learning lab":
             )
 
     st.subheader("Optimize buy-low / sell-high rules")
-    if st.button("⚙️ Optimize from long trades", type="primary"):
+    if st.button("⚙️ Optimize from spot trades", type="primary"):
         new_p, msg = optimize_longs(log, params)
         save_params(new_p)
         st.success("Updated.")
@@ -662,7 +662,7 @@ if page == "Learning lab":
 # SCANNER
 # ══════════════════════════════════════════════════════════════
 if page == "Multi-ticker scanner":
-    st.title("📡 Scanner · Long only")
+    st.title("📡 Scanner · Spot only")
     names = st.multiselect("Assets", list(CRYPTO.keys()), default=[n for n in DEFAULT_SCAN if n in CRYPTO])
     if not names:
         st.stop()
@@ -707,8 +707,8 @@ if custom.strip():
     symbol = custom.strip().upper()
     name = symbol
 
-st.title("⚡ Buy Low · Sell High · Long only")
-st.caption(f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC · {name} · {interval} · no shorts")
+st.title("⚡ Buy Low · Sell High · Spot only")
+st.caption(f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC · {name} · {interval} · spot only · no shorts · no leverage")
 
 htf_i = HTF_MAP.get(interval, "1h")
 with st.spinner("Loading…"):
@@ -732,7 +732,7 @@ paper_rows = simulate_longs(df_full.tail(min(400, len(df_full))), name, symbol, 
 if paper_rows:
     append_trades(paper_rows)
 
-st.success(f"HTF ({htf_i}) **{htf_bias}** · paper longs closed this window: {len(paper_rows)}")
+st.success(f"HTF ({htf_i}) **{htf_bias}** · paper spot round-trips closed this window: {len(paper_rows)}")
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Price", fmt_px(price), f"{pct:+.2f}%")
@@ -745,7 +745,7 @@ c4.metric("Score", f"{int(latest['Score'])}")
 c5.metric("BB %", f"{float(latest['BB_pct'])*100:.0f}%")
 c6.metric("HTF", htf_bias)
 
-st.markdown("### 📋 Long trade plan")
+st.markdown("### 📋 Spot trade plan")
 if sig == "BUY":
     plan = build_plan(latest, account_usd, risk_pct, min_rr)
     checks = confluence_checklist(latest, htf_bias, min_rr)
@@ -755,7 +755,7 @@ if sig == "BUY":
     with p1:
         st.markdown(f"""
         <div class="plan-box">
-        <b>BUY LOW</b> (long only)<br>
+        <b>BUY LOW</b> (spot only)<br>
         Entry {fmt_px(plan['entry'])}<br>
         Stop {fmt_px(plan['stop'])} ({plan['risk_pct']:.2f}%)<br>
         Sell-high T1 / T2: {fmt_px(plan['t1'])} / {fmt_px(plan['t2'])}<br>
@@ -773,9 +773,9 @@ if sig == "BUY":
         st.markdown(f"{'<span class=check-ok>✓</span>' if ok else '<span class=check-no>✗</span>'} {text}", unsafe_allow_html=True)
 elif sig == "SELL_HIGH":
     st.markdown(
-        f"<div class='alert-box alert-sell'><b>SELL HIGH</b> — take profit / exit zone for longs "
+        f"<div class='alert-box alert-sell'><b>SELL HIGH</b> — sell coin for cash (spot exit) "
         f"(RSI {float(latest['RSI']):.0f}, BB {float(latest['BB_pct'])*100:.0f}%). "
-        f"Not a short entry.</div>",
+        f"Not a short. Not leverage. Spot sell only.</div>",
         unsafe_allow_html=True,
     )
     st.caption(f"Sell zone ≈ {fmt_px(float(latest['Sell_zone']))}")
@@ -797,20 +797,20 @@ with a:
 with b:
     tight_bar_chart(df, "Volume", height=200)
 
-st.subheader("Paper longs this window")
+st.subheader("Paper spot trades this window")
 if paper_rows:
     st.dataframe(pd.DataFrame(paper_rows), use_container_width=True, height=220)
 else:
-    st.caption("No closed long round-trips in this window.")
+    st.caption("No closed spot round-trips in this window.")
 
 with st.expander("Rules"):
     st.markdown("""
-**Long only**
-- **BUY LOW** — enter long when score/RSI/BB say “cheap” and HTF is UP or RANGE  
-- **SELL HIGH** — exit long when RSI/BB say “expensive” (or stop hit)  
-- **Never** opens a short  
+**Spot only**
+- **BUY LOW** — spend cash, buy the coin when cheap (score/RSI/BB) and HTF is UP or RANGE  
+- **SELL HIGH** — sell the coin for cash when expensive (or stop)  
+- **Never** short · **never** use leverage — only spot inventory (cash or coin)  
 
-Learning adjusts buy thresholds and sell-high RSI/BB from your paper long results.
+Learning adjusts buy-low and sell-high thresholds from paper spot trades.
 """)
 
 if live:
