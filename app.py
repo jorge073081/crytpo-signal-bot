@@ -1210,17 +1210,21 @@ if symbol != "BTCUSDT" and not btc_raw.empty and "ret_6" in df.columns:
                 rel_vs_btc = coin_r - btc_r
     except Exception:
         rel_vs_btc = None
-    onchain_ctx = {
-        "stable_chg_7d_pct": stables.get("stable_chg_7d_pct"),
-        "tvl_chg_7d_pct": tvl_info.get("tvl_chg_7d_pct") or alt_oc.get("tvl_chg_7d_pct"),
-        "sentiment_up": fund.get("sentiment_up"),
-        "fee_fast": btc_oc.get("fee_fast"),
-        "is_btc": bool(btc_oc),
-    }
-    dec = decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=rel_vs_btc, news_sent=news_sent, strict_mode=strict_mode, onchain=onchain_ctx)
+
+onchain_ctx = {
+    "stable_chg_7d_pct": stables.get("stable_chg_7d_pct"),
+    "tvl_chg_7d_pct": (tvl_info.get("tvl_chg_7d_pct") if tvl_info else None) or alt_oc.get("tvl_chg_7d_pct"),
+    "sentiment_up": fund.get("sentiment_up"),
+    "fee_fast": btc_oc.get("fee_fast"),
+    "is_btc": bool(btc_oc),
+}
+dec = decide(
+    last, htf, fng_val, fng_label, global_m, macro,
+    rel_vs_btc=rel_vs_btc, news_sent=news_sent, strict_mode=strict_mode, onchain=onchain_ctx,
+)
 
 # Live price for entry/exit display
-if live_px is not None:
+if live_px is not None and dec is not None:
     dec["price"] = live_px
     if dec["action"] == "BUY":
         dec["entry"] = live_px
