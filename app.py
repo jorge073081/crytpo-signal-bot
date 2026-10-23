@@ -21,6 +21,7 @@ import xml.etree.ElementTree as ET
 import os
 import json
 import re
+from pathlib import Path
 
 st.set_page_config(page_title="Spot Desk", page_icon="⚡", layout="wide")
 
@@ -60,6 +61,104 @@ CRYPTO = {
 INTERVALS = ["15m", "30m", "1h", "4h", "1d"]
 HTF_MAP = {"15m": "1h", "30m": "4h", "1h": "4h", "4h": "1d", "1d": "1d"}
 BINANCE = ["https://data-api.binance.vision", "https://api.binance.us"]
+
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+TRADES_PATH = DATA_DIR / "paper_trades.csv"
+
+
+def load_paper_trades():
+    frames = []
+    if TRADES_PATH.exists():
+        try:
+            frames.append(pd.read_csv(TRADES_PATH))
+        except Exception:
+            pass
+    if st.session_state.get("paper_trades"):
+        frames.append(pd.DataFrame(st.session_state["paper_trades"]))
+    if not frames:
+        return pd.DataFrame(columns=[
+            "logged_at", "asset", "symbol", "interval", "side",
+            "entry_time", "exit_time", "entry", "exit", "stop",
+            "pnl_pct", "exit_reason", "result", "confidence", "htf", "score", "strict",
+        ])
+    df = pd.concat(frames, ignore_index=True)
+    if "entry_time" in df.columns:
+        df = df.drop_duplicates(subset=["symbol", "interval", "entry_time", "exit_time"], keep="last")
+    return df
+
+
+def save_paper_trades(df):
+    st.session_state["paper_trades"] = df.to_dict("records")
+    try:
+        DATA_DIR.mkdir(exist_ok=True)
+        df.to_csv(TRADES_PATH, index=False)
+    except Exception:
+        pass
+
+
+def append_paper_trades(rows):
+    if not rows:
+        return
+    old = load_paper_trades()
+    combined = pd.concat([old, pd.DataFrame(rows)], ignore_index=True)
+    if "entry_time" in combined.columns:
+        combined = combined.drop_duplicates(
+            subset=["symbol", "interval", "entry_time", "exit_time"], keep="last"
+        )
+    save_paper_trades(combined)
+
+
+def simulate_paper(df, asset, symbol, interval, htf, strict_mode, min_conf_high_only=False):
+    """Walk bars: enter BUY, exit SELL or stop."""
+    rows = []
+    in_pos = False
+    entry = entry_t = stop = target = conf = score = None
+    for ts, row in df.iterrows():
+        # Rebuild minimal decision fields from row signals already on df if present
+        sig = row.get("Signal")
+        if sig is None:
+            continue
+        if not in_pos and sig == "BUY":
+            c = str(row.get("Conf", "MED"))
+            if min_conf_high_only and c != "HIGH":
+                continue
+            in_pos = True
+            entry = float(row["Close"])
+            entry_t = ts
+            stop = float(row["Stop"]) if pd.notna(row.get("Stop")) else entry * 0.98
+            target = float(row["Exit"]) if pd.notna(row.get("Exit")) else entry * 1.02
+            conf = c
+            score = float(row["Score"]) if pd.notna(row.get("Score")) else None
+        elif in_pos:
+            px = float(row["Close"])
+            hit_stop = px <= stop
+            hit_tgt = px >= target
+            sell = sig == "SELL"
+            if hit_stop or hit_tgt or sell:
+                pnl = (px - entry) / entry * 100
+                reason = "STOP" if hit_stop else ("TARGET" if hit_tgt else "SELL")
+                rows.append({
+                    "logged_at": datetime.now(timezone.utc).isoformat(),
+                    "asset": asset,
+                    "symbol": symbol,
+                    "interval": interval,
+                    "side": "BUY",
+                    "entry_time": str(entry_t),
+                    "exit_time": str(ts),
+                    "entry": round(entry, 8),
+                    "exit": round(px, 8),
+                    "stop": round(stop, 8),
+                    "pnl_pct": round(pnl, 3),
+                    "exit_reason": reason,
+                    "result": "WIN" if pnl > 0 else "LOSS",
+                    "confidence": conf,
+                    "htf": htf,
+                    "score": score,
+                    "strict": bool(strict_mode),
+                })
+                in_pos = False
+    return rows
 
 
 def get_fred_key():
@@ -511,7 +610,7 @@ def load_macro(fred_key):
     return {"DGS10": dgs10, "FEDFUNDS": fed, "UNRATE": unrate}
 
 
-def decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=None, news_sent=None):
+def decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=None, news_sent=None, strict_mode=False):
     """
     Stricter spot decision engine.
     - Required: value (BB or RSI) + HTF not DOWN
@@ -634,18 +733,39 @@ def decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=None, news
     )
 
     # BUY: must be at value, pass HTF rule, no hard block, strong score
+    min_ratio = 0.72 if strict_mode else 0.62
+    min_score = 9.0 if strict_mode else 7.0
     buy_low = (
         not sell_high
         and not hard_block
         and at_value
         and htf_ok
-        and ratio >= 0.62
-        and score >= 7.0
+        and ratio >= min_ratio
+        and score >= min_score
     )
+    # Strict: only UP or RANGE already; also require turn + no weak volume
+    if strict_mode and buy_low:
+        if not turn_ok:
+            buy_low = False
+        if vol_ratio < 0.55:
+            buy_low = False
+        if atr_pct is not None and atr_pct >= 4.0:
+            buy_low = False
+        if htf == "RANGE" and rsi_v > 34:
+            # stricter value in chop
+            if not (bb <= 0.28 or rsi_v <= 32):
+                buy_low = False
 
     if buy_low:
         action = "BUY"
-        conf = "HIGH" if ratio >= 0.78 and turn_ok else "MED"
+        if strict_mode:
+            conf = "HIGH" if (ratio >= 0.80 and turn_ok) else "MED"
+            # Strict mode: surface only HIGH as actionable BUY
+            if conf != "HIGH":
+                action = "WAIT"
+                conf = "MED"  # shown as not strict-qualified
+        else:
+            conf = "HIGH" if ratio >= 0.78 and turn_ok else "MED"
     elif sell_high:
         action = "SELL"
         exit_px = price
@@ -678,6 +798,7 @@ def decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=None, news
         "bb_squeeze": bb_squeeze,
         "rel_vs_btc": rel_vs_btc,
         "news_sent": news_sent,
+        "strict_mode": strict_mode,
         "price": price,
     }
 
@@ -735,9 +856,90 @@ if st.sidebar.button("Refresh now"):
     st.cache_data.clear()
     st.rerun()
 
+# ── Paper log page ────────────────────────────────────────────
+if page == "Paper log":
+    st.title("Paper trade log")
+    st.caption("Simulated spot round-trips from the Trade page. Export often on Streamlit Cloud.")
+    log = load_paper_trades()
+    up = st.file_uploader("Import CSV", type=["csv"])
+    if up is not None:
+        try:
+            incoming = pd.read_csv(up)
+            merged = pd.concat([log, incoming], ignore_index=True)
+            save_paper_trades(merged)
+            st.success("Imported")
+            st.rerun()
+        except Exception as e:
+            st.error(e)
+
+    closed = log[log["result"].isin(["WIN", "LOSS"])] if not log.empty and "result" in log.columns else pd.DataFrame()
+    if closed.empty:
+        st.info("No closed paper trades yet. Open **Trade**, load a coin — simulations append here.")
+    else:
+        wins = closed[closed["result"] == "WIN"]
+        losses = closed[closed["result"] == "LOSS"]
+        wr = len(wins) / len(closed) * 100
+        exp = closed["pnl_pct"].mean()
+        avg_w = wins["pnl_pct"].mean() if len(wins) else 0
+        avg_l = losses["pnl_pct"].mean() if len(losses) else 0
+        gp = wins["pnl_pct"].sum() if len(wins) else 0
+        gl = abs(losses["pnl_pct"].sum()) if len(losses) else 0
+        pf = (gp / gl) if gl > 0 else float("inf")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Trades", len(closed))
+        m2.metric("Win rate", f"{wr:.0f}%")
+        m3.metric("Expectancy", f"{exp:+.2f}%")
+        m4.metric("Avg win / loss", f"{avg_w:+.2f}% / {avg_l:+.2f}%")
+        m5.metric("Profit factor", f"{pf:.2f}" if pf != float("inf") else "∞")
+
+        if "confidence" in closed.columns:
+            st.subheader("By confidence")
+            st.dataframe(
+                closed.groupby("confidence").agg(
+                    n=("pnl_pct", "count"),
+                    win_rate=("result", lambda s: (s == "WIN").mean() * 100),
+                    avg_pnl=("pnl_pct", "mean"),
+                ).round(2),
+                use_container_width=True,
+            )
+        if "htf" in closed.columns:
+            st.subheader("By HTF")
+            st.dataframe(
+                closed.groupby("htf").agg(
+                    n=("pnl_pct", "count"),
+                    win_rate=("result", lambda s: (s == "WIN").mean() * 100),
+                    avg_pnl=("pnl_pct", "mean"),
+                ).round(2),
+                use_container_width=True,
+            )
+        if "strict" in closed.columns:
+            st.subheader("Strict vs normal")
+            st.dataframe(
+                closed.groupby("strict").agg(
+                    n=("pnl_pct", "count"),
+                    win_rate=("result", lambda s: (s == "WIN").mean() * 100),
+                    avg_pnl=("pnl_pct", "mean"),
+                ).round(2),
+                use_container_width=True,
+            )
+        st.subheader("Trades")
+        st.dataframe(closed.sort_values("logged_at", ascending=False), use_container_width=True, height=360)
+        st.download_button(
+            "Download CSV",
+            closed.to_csv(index=False).encode(),
+            file_name="paper_trades.csv",
+            mime="text/csv",
+        )
+    if st.button("Clear paper log"):
+        save_paper_trades(pd.DataFrame())
+        st.rerun()
+    st.stop()
+
 # ── Data ──────────────────────────────────────────────────────
 now = datetime.now(timezone.utc)
 st.title(f"{name}")
+if strict_mode:
+    st.caption("STRICT MODE — only HIGH-quality BUYs")
 if live:
     st.markdown(
         f"<span class='live-dot'>● LIVE</span> · {interval} · {now.strftime('%H:%M:%S')} UTC",
@@ -794,7 +996,7 @@ if symbol != "BTCUSDT" and not btc_raw.empty and "ret_6" in df.columns:
                 rel_vs_btc = coin_r - btc_r
     except Exception:
         rel_vs_btc = None
-dec = decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=rel_vs_btc, news_sent=news_sent)
+dec = decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=rel_vs_btc, news_sent=news_sent, strict_mode=strict_mode)
 
 # Live price for entry/exit display
 if live_px is not None:
@@ -832,6 +1034,43 @@ if alert_on and action in ("BUY", "SELL"):
             )
 st.session_state["last_action"] = action
 
+# Paper trades: simple walk-forward using indicator columns (fast)
+def _quick_tag(frame, htf_bias, strict):
+    out = frame.copy()
+    rsi_v = out["RSI"]
+    bb = out["BB_pct"]
+    atr_pct = out.get("ATR_pct", pd.Series(1.0, index=out.index))
+    turn = out.get("RSI_rising", False) | out.get("MACD_up", False)
+    vol = out.get("Vol_ratio", 1.0)
+    htf_ok = htf_bias in ("UP", "RANGE")
+    at_val = (bb <= 0.35) | (rsi_v <= 38)
+    if strict:
+        at_val = (bb <= 0.30) | (rsi_v <= 34)
+    sell = (rsi_v >= 68) & (bb >= 0.70) | (rsi_v >= 72) | (bb >= 0.88)
+    buy = at_val & htf_ok & (~sell)
+    if strict:
+        buy = buy & turn & (vol >= 0.55) & (atr_pct < 4.0)
+    conf = np.where(buy & turn & (rsi_v <= 32), "HIGH", np.where(buy, "MED", "—"))
+    if strict:
+        buy = buy & (conf == "HIGH")
+    out["Signal"] = np.where(sell, "SELL", np.where(buy, "BUY", "WAIT"))
+    out["Conf"] = conf
+    risk = (out["Close"] - out["Close"] + out["ATR"] * 1.5).clip(lower=out["Close"] * 0.002)
+    out["Stop"] = out["Close"] - 1.5 * out["ATR"]
+    out["Exit"] = out["Close"] + 2.0 * risk
+    out["Score"] = np.where(buy, 10, 0)
+    return out
+
+_sim_n = min(150, len(df))
+_tagged = _quick_tag(df.tail(_sim_n), htf, strict_mode)
+_paper_rows = simulate_paper(
+    _tagged, name, symbol, interval, htf, strict_mode,
+    min_conf_high_only=strict_mode,
+)
+if _paper_rows:
+    append_paper_trades(_paper_rows)
+
+
 size = 0.0
 if action == "BUY" and dec.get("stop") and dec.get("entry"):
     risk_amt = dec["entry"] - dec["stop"]
@@ -845,7 +1084,7 @@ if action == "BUY":
     st.markdown(
         f"""
         <div class="card">
-          <div class="small">BEST EFFORT SPOT CALL · confidence {dec['confidence']}</div>
+          <div class="small">{('STRICT · ' if strict_mode else '')}BEST EFFORT · conf {dec['confidence']}</div>
           <div class="big buy">BUY</div>
           <p style="font-size:1.15rem;margin-top:0.8rem">
             <b>Entry</b> (buy at market)<br><span class="big buy">{fmt(dec['entry'])}</span>
@@ -863,7 +1102,7 @@ elif action == "SELL":
     st.markdown(
         f"""
         <div class="card">
-          <div class="small">BEST EFFORT SPOT CALL · confidence {dec['confidence']}</div>
+          <div class="small">{('STRICT · ' if strict_mode else '')}BEST EFFORT · conf {dec['confidence']}</div>
           <div class="big sell">SELL</div>
           <p style="font-size:1.15rem;margin-top:0.8rem">
             <b>Exit</b> (sell coin for cash)<br><span class="big sell">{fmt(dec['exit'])}</span>
@@ -894,6 +1133,15 @@ c2.metric("RSI", f"{dec['rsi']:.0f}")
 c3.metric("HTF", htf)
 c4.metric("Fear & Greed", f"{fng_val}" if fng_val is not None else "—", fng_label)
 c5.metric("Score", f"{dec['score']}/{dec['max_score']}")
+
+_plog = load_paper_trades()
+if len(_plog):
+    _c = _plog[_plog["result"].isin(["WIN", "LOSS"])] if "result" in _plog.columns else _plog
+    if len(_c):
+        st.caption(
+            f"Paper log: **{len(_c)}** closed · win rate **{( _c['result']=='WIN').mean()*100:.0f}%** · "
+            f"expectancy **{_c['pnl_pct'].mean():+.2f}%** · see **Paper log** page"
+        )
 
 st.subheader("Why (weighted checklist)")
 st.caption("Only factors with data are scored. Blank futures feeds are ignored on purpose.")
@@ -1022,4 +1270,3 @@ st.caption("Not financial advice · You place all orders")
 if live:
     time.sleep(secs)
     st.rerun()
-
