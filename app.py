@@ -817,7 +817,7 @@ def load_macro(fred_key):
     return {"DGS10": dgs10, "FEDFUNDS": fed, "UNRATE": unrate}
 
 
-def decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=None, news_sent=None, strict_mode=False, onchain=None):
+def decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=None, news_sent=None, strict_mode=False, onchain=None, fee_pct=0.1):
     """
     Stricter spot decision engine.
     - Required: value (BB or RSI) + HTF not DOWN
@@ -839,7 +839,21 @@ def decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=None, news
 
     stop = min(price - 1.5 * atr, float(last["Swing_low"]) * 0.998)
     risk = max(price - stop, atr * 0.4)
+    # Gross target ~2R; fee-aware exit pads for round-trip trading fees
+    fee = max(0.0, float(fee_pct)) / 100.0  # e.g. 0.1% → 0.001
     exit_px = price + 2.0 * risk
+    # Net R:R after fees on entry + exit (approx fee*price each side)
+    fee_cost = 2.0 * fee * price
+    risk_net = risk + fee * price  # stop path also pays entry fee
+    reward_net = max(exit_px - price - fee_cost, 0.0)
+    rr_gross = (exit_px - price) / risk if risk > 0 else 0.0
+    rr_net = reward_net / risk_net if risk_net > 0 else 0.0
+    # Stretch target slightly so net R:R stays near 2 when fees exist
+    if fee > 0 and risk > 0:
+        exit_px = price + 2.0 * risk + fee_cost
+        reward_net = max(exit_px - price - fee_cost, 0.0)
+        rr_net = reward_net / risk_net if risk_net > 0 else 0.0
+        rr_gross = (exit_px - price) / risk if risk > 0 else 0.0
 
     # Weighted factors: (name, weight, pass?, detail)
     factors = []
@@ -924,6 +938,11 @@ def decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=None, news
         fee_ok = float(oc["fee_fast"]) < 150
         factors.append(("BTC fees not extreme", 1.0, fee_ok, f"fast {oc['fee_fast']} sat/vB"))
 
+    # Fee-aware reward must still be worth it
+    factors.append(
+        ("Net R:R after fees OK", 2.0, rr_net >= 1.5, f"net {rr_net:.2f}R · gross {rr_gross:.2f}R · fee {fee_pct}%")
+    )
+
     # Score
     score = sum(w for _, w, ok, _ in factors if ok)
     max_score = sum(w for _, w, _, _ in factors)
@@ -944,6 +963,8 @@ def decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=None, news
     if news_sent and news_sent.get("score") is not None:
         if float(news_sent["score"]) <= -0.35 or news_sent.get("label") == "TOXIC":
             hard_block.append(f"Toxic news sentiment ({news_sent.get('label')})")
+    if rr_net < 1.2:
+        hard_block.append(f"Net R:R too low after fees ({rr_net:.2f})")
 
     # SELL HIGH: take profit / exit zone for holders
     sell_high = (
@@ -1020,6 +1041,9 @@ def decide(last, htf, fng_val, fng_label, global_m, macro, rel_vs_btc=None, news
         "rel_vs_btc": rel_vs_btc,
         "news_sent": news_sent,
         "strict_mode": strict_mode,
+        "rr_gross": round(rr_gross, 2),
+        "rr_net": round(rr_net, 2),
+        "fee_pct": fee_pct,
         "price": price,
     }
 
@@ -1045,7 +1069,7 @@ def chart_price(df):
 # ── Sidebar ───────────────────────────────────────────────────
 fred_key = get_fred_key()
 
-def quick_signal(symbol, interval, strict_mode, fng_val, fng_label, global_m, macro, news_sent):
+def quick_signal(symbol, interval, strict_mode, fng_val, fng_label, global_m, macro, news_sent, fee_pct=0.1):
     """Lightweight signal for dashboard strip (SOL/XRP/DOT etc.)."""
     try:
         raw = binance_klines(symbol, interval, 120)
@@ -1081,6 +1105,7 @@ def quick_signal(symbol, interval, strict_mode, fng_val, fng_label, global_m, ma
         dec = decide(
             last, htf, fng_val, fng_label, global_m, macro,
             rel_vs_btc=rel, news_sent=news_sent, strict_mode=strict_mode, onchain=onchain,
+            fee_pct=fee_pct,
         )
         px = live if live is not None else dec["price"]
         return {
@@ -1092,6 +1117,10 @@ def quick_signal(symbol, interval, strict_mode, fng_val, fng_label, global_m, ma
             "htf": htf,
             "score": dec["score"],
             "max_score": dec["max_score"],
+            "rr_net": dec.get("rr_net"),
+            "entry": dec.get("entry") or px,
+            "exit": dec.get("exit"),
+            "stop": dec.get("stop"),
         }
     except Exception:
         return {"symbol": symbol, "action": "—", "price": None, "rsi": None, "conf": "—"}
@@ -1103,6 +1132,15 @@ strict_mode = st.sidebar.checkbox(
     value=True,
     help="Only HIGH-quality BUYs: higher score, momentum turn, calmer ATR%, deeper value in ranges",
 )
+fee_pct = st.sidebar.number_input(
+    "Round-trip fee % (each side×2)",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.10,
+    step=0.05,
+    help="e.g. 0.10 = 0.10% fee each side → 0.20% round trip. Used for net R:R.",
+)
+show_scanner = st.sidebar.checkbox("Scanner table", value=True)
 name = st.sidebar.selectbox("Coin", list(CRYPTO.keys()), index=0)
 symbol = CRYPTO[name]
 custom = st.sidebar.text_input("Or pair", placeholder="BTCUSDT")
@@ -1221,6 +1259,7 @@ onchain_ctx = {
 dec = decide(
     last, htf, fng_val, fng_label, global_m, macro,
     rel_vs_btc=rel_vs_btc, news_sent=news_sent, strict_mode=strict_mode, onchain=onchain_ctx,
+    fee_pct=fee_pct,
 )
 
 # Live price for entry/exit display
@@ -1231,8 +1270,15 @@ if live_px is not None and dec is not None:
         atr = dec["atr"]
         stop = min(live_px - 1.5 * atr, float(last["Swing_low"]) * 0.998)
         risk = max(live_px - stop, atr * 0.4)
+        fee = max(0.0, float(fee_pct)) / 100.0
+        fee_cost = 2.0 * fee * live_px
+        exit_px = live_px + 2.0 * risk + fee_cost
+        risk_net = risk + fee * live_px
+        reward_net = max(exit_px - live_px - fee_cost, 0.0)
         dec["stop"] = stop
-        dec["exit"] = live_px + 2.0 * risk
+        dec["exit"] = exit_px
+        dec["rr_gross"] = round((exit_px - live_px) / risk, 2) if risk else 0
+        dec["rr_net"] = round(reward_net / risk_net, 2) if risk_net else 0
     elif dec["action"] == "SELL":
         dec["exit"] = live_px
 
@@ -1281,7 +1327,7 @@ if action == "BUY":
             <b>Exit target</b> (sell later — above entry)<br><span class="big sell">{fmt(dec['exit'])}</span>
           </p>
           {lim_h}
-          <p class="small">Stop {fmt(dec['stop'])} · Size ≈ {size:.6g} · Score {dec['score']}/{dec['max_score']}</p>
+          <p class="small">Stop {fmt(dec['stop'])} · Size ≈ {size:.6g} · Score {dec['score']}/{dec['max_score']} · R:R gross {dec.get('rr_gross', '—')} · <b>net {dec.get('rr_net', '—')}</b> (fees {fee_pct}%)</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1322,34 +1368,64 @@ c3.metric("HTF", htf)
 c4.metric("Fear & Greed", f"{fng_val}" if fng_val is not None else "—", fng_label)
 c5.metric("Score", f"{dec['score']}/{dec['max_score']}")
 
-# ── Main dashboard: always show SOL, XRP, DOT ──
-st.subheader("Watchlist · SOL · XRP · DOT")
-st.caption("Same rules as the main card (Strict applies). Click a coin in the sidebar to drill in.")
-wl_syms = [("Solana", "SOLUSDT"), ("XRP", "XRPUSDT"), ("Polkadot", "DOTUSDT")]
-wl_cols = st.columns(3)
-for col, (label, sym) in zip(wl_cols, wl_syms):
-    with col:
-        q = quick_signal(sym, interval, strict_mode, fng_val, fng_label, global_m, macro, news_sent)
-        act = q.get("action") or "—"
-        color = "#00c853" if act == "BUY" else ("#ffab00" if act == "SELL" else "#90a4ae")
-        px = fmt(q["price"]) if q.get("price") is not None else "—"
-        rsi = f"{q['rsi']:.0f}" if q.get("rsi") is not None else "—"
-        conf = q.get("conf") or "—"
-        htf_s = q.get("htf") or "—"
-        sc = q.get("score")
-        ms = q.get("max_score")
-        score_s = f"{sc}/{ms}" if sc is not None and ms is not None else "—"
-        st.markdown(
-            f"""
-            <div class="card" style="padding:0.9rem 1rem;">
-              <div class="small">{label} · {sym}</div>
-              <div class="big" style="color:{color};font-size:1.5rem;">{act}</div>
-              <div>Price <b>{px}</b> · RSI <b>{rsi}</b></div>
-              <div class="small">HTF {htf_s} · conf {conf} · score {score_s}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+# ── Scanner table (multi-coin) ──
+if show_scanner:
+    st.subheader("Scanner")
+    st.caption("Sorted by action then score. Strict + fee-aware net R:R apply. Select a coin in the sidebar for full detail.")
+    scan_names = [
+        "Bitcoin", "Ethereum", "Solana", "XRP", "Polkadot", "ONDO",
+        "Stellar", "Hedera", "Algorand", "BNB", "Cardano", "Avalanche",
+        "Chainlink", "Sui", "Near",
+    ]
+    rows = []
+    prog = st.progress(0)
+    for i, nm in enumerate(scan_names):
+        sym = CRYPTO.get(nm)
+        if not sym:
+            continue
+        q = quick_signal(sym, interval, strict_mode, fng_val, fng_label, global_m, macro, news_sent, fee_pct=fee_pct)
+        rows.append({
+            "Coin": nm,
+            "Pair": sym,
+            "Signal": q.get("action") or "—",
+            "Conf": q.get("conf") or "—",
+            "Price": q.get("price"),
+            "RSI": q.get("rsi"),
+            "HTF": q.get("htf") or "—",
+            "Score": q.get("score"),
+            "Max": q.get("max_score"),
+            "Net R:R": q.get("rr_net"),
+            "Entry": q.get("entry"),
+            "Exit": q.get("exit"),
+            "Stop": q.get("stop"),
+        })
+        prog.progress((i + 1) / max(len(scan_names), 1))
+    prog.empty()
+    scan_df = pd.DataFrame(rows)
+    if not scan_df.empty:
+        # sort BUY first, then SELL, then WAIT; then score desc
+        order = {"BUY": 0, "SELL": 1, "WAIT": 2, "—": 3}
+        scan_df["_o"] = scan_df["Signal"].map(lambda x: order.get(x, 9))
+        scan_df = scan_df.sort_values(["_o", "Score"], ascending=[True, False]).drop(columns=["_o"])
+        show = scan_df.copy()
+        for c in ["Price", "Entry", "Exit", "Stop"]:
+            if c in show.columns:
+                show[c] = show[c].apply(lambda x: fmt(x) if x is not None and pd.notna(x) else "—")
+        if "RSI" in show.columns:
+            show["RSI"] = show["RSI"].apply(lambda x: f"{x:.0f}" if x is not None and pd.notna(x) else "—")
+        if "Net R:R" in show.columns:
+            show["Net R:R"] = show["Net R:R"].apply(lambda x: f"{x:.2f}" if x is not None and pd.notna(x) else "—")
+        if "Score" in show.columns and "Max" in show.columns:
+            show["Score"] = show.apply(
+                lambda r: f"{r['Score']}/{r['Max']}" if pd.notna(r["Score"]) else "—", axis=1
+            )
+            show = show.drop(columns=["Max"], errors="ignore")
+        st.dataframe(show, use_container_width=True, hide_index=True, height=420)
+        buys = scan_df[scan_df["Signal"] == "BUY"]
+        if len(buys):
+            st.success(f"Scanner finds **{len(buys)}** BUY setup(s) under current rules.")
+        else:
+            st.info("No BUY setups in scanner right now — WAIT is fine.")
 
 st.subheader("Why (weighted checklist)")
 st.caption("Only factors with data are scored. Blank futures feeds are ignored on purpose.")
