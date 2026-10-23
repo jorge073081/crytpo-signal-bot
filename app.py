@@ -21,6 +21,7 @@ import xml.etree.ElementTree as ET
 import os
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title="Spot Desk", page_icon="⚡", layout="wide")
 
@@ -212,6 +213,18 @@ def binance_ticker_price(symbol):
         except Exception:
             continue
     return None
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def binance_all_prices():
+    for host in BINANCE:
+        try:
+            r = requests.get(f"{host}/api/v3/ticker/price", timeout=12)
+            if r.status_code == 200 and isinstance(r.json(), list):
+                return {row["symbol"]: float(row["price"]) for row in r.json() if "symbol" in row}
+        except Exception:
+            continue
+    return {}
 
 
 @st.cache_data(ttl=20, show_spinner=False)
@@ -1113,45 +1126,82 @@ def chart_price(df):
 # ── Sidebar ───────────────────────────────────────────────────
 fred_key = get_fred_key()
 
-def quick_signal(symbol, interval, strict_mode, fng_val, fng_label, global_m, macro, news_sent, fee_pct=0.1):
-    """Lightweight signal for dashboard strip (SOL/XRP/DOT etc.)."""
+def _prefilter_row(symbol, interval, price_map):
+    """Stage 1: candles + indicators only (no HTF/decide)."""
     try:
-        raw = binance_klines(symbol, interval, 120)
-        if raw.empty:
-            return {"symbol": symbol, "action": "—", "price": None, "rsi": None, "conf": "—"}
+        raw = binance_klines(symbol, interval, 80)
+        if raw.empty or len(raw) < 35:
+            return None
         df = technicals(raw)
         if df.empty:
-            return {"symbol": symbol, "action": "—", "price": None, "rsi": None, "conf": "—"}
-        htf_i = HTF_MAP.get(interval, "1h")
-        htf_raw = binance_klines(symbol, htf_i, 80)
-        htf = trend_bias(htf_raw) if not htf_raw.empty else "RANGE"
-        live = binance_ticker_price(symbol)
+            return None
         last = df.iloc[-1]
+        px = price_map.get(symbol)
+        if px is None:
+            px = float(last["Close"])
+        rsi_v = float(last["RSI"])
+        bb = float(last["BB_pct"]) if pd.notna(last.get("BB_pct")) else 0.5
+        atr = float(last["ATR"]) if pd.notna(last.get("ATR")) else px * 0.01
+        atr_pct = float(last["ATR_pct"]) if pd.notna(last.get("ATR_pct")) else None
+        ret6 = float(last["ret_6"]) if "ret_6" in df.columns and pd.notna(last.get("ret_6")) else None
+        interesting = (
+            bb <= 0.42 or rsi_v <= 42 or rsi_v >= 65 or bb >= 0.72
+            or (atr_pct is not None and atr_pct >= 3.5)
+        )
+        return {
+            "symbol": symbol,
+            "df": df,
+            "last": last,
+            "price": px,
+            "rsi": rsi_v,
+            "bb": bb,
+            "atr": atr,
+            "atr_pct": atr_pct,
+            "ret6": ret6,
+            "interesting": interesting,
+        }
+    except Exception:
+        return None
+
+
+def _full_from_pre(pre, interval, strict_mode, fng_val, fng_label, global_m, macro, news_sent, fee_pct, btc_ret6):
+    """Stage 2: HTF + decide for candidates."""
+    symbol = pre["symbol"]
+    try:
+        htf_i = HTF_MAP.get(interval, "1h")
+        htf_raw = binance_klines(symbol, htf_i, 60)
+        htf = trend_bias(htf_raw) if not htf_raw.empty else trend_bias(pre["df"])
         rel = None
-        if symbol != "BTCUSDT":
-            try:
-                btc_raw = binance_klines("BTCUSDT", interval, 40)
-                if not btc_raw.empty:
-                    bt = technicals(btc_raw)
-                    if not bt.empty and "ret_6" in df.columns and "ret_6" in bt.columns:
-                        rel = float(last["ret_6"]) - float(bt.iloc[-1]["ret_6"])
-            except Exception:
-                pass
-        alt = load_alt_onchain(symbol)
-        fund = coingecko_fundamentals(CG_IDS.get(symbol, "")) if CG_IDS.get(symbol) else {}
+        if symbol != "BTCUSDT" and btc_ret6 is not None and pre.get("ret6") is not None:
+            rel = pre["ret6"] - btc_ret6
         onchain = {
-            "stable_chg_7d_pct": None,  # skip heavy stables per card
-            "tvl_chg_7d_pct": alt.get("tvl_chg_7d_pct"),
-            "sentiment_up": fund.get("sentiment_up"),
-            "fee_fast": (alt.get("btc") or {}).get("fee_fast"),
+            "stable_chg_7d_pct": None,
+            "tvl_chg_7d_pct": None,
+            "sentiment_up": None,
+            "fee_fast": None,
             "is_btc": symbol == "BTCUSDT",
         }
         dec = decide(
-            last, htf, fng_val, fng_label, global_m, macro,
+            pre["last"], htf, fng_val, fng_label, global_m, macro,
             rel_vs_btc=rel, news_sent=news_sent, strict_mode=strict_mode, onchain=onchain,
             fee_pct=fee_pct,
         )
-        px = live if live is not None else dec["price"]
+        px = pre["price"]
+        entry = exit_px = stop = None
+        rr_net = dec.get("rr_net")
+        if dec["action"] == "BUY":
+            atr = dec["atr"]
+            stop = min(px - 1.5 * atr, float(pre["last"]["Swing_low"]) * 0.998)
+            risk = max(px - stop, atr * 0.4)
+            fee = max(0.0, float(fee_pct)) / 100.0
+            fee_cost = 2.0 * fee * px
+            exit_px = px + 2.0 * risk + fee_cost
+            risk_net = risk + fee * px
+            reward_net = max(exit_px - px - fee_cost, 0.0)
+            entry = px
+            rr_net = round(reward_net / risk_net, 2) if risk_net else 0
+        elif dec["action"] == "SELL":
+            exit_px = px
         return {
             "symbol": symbol,
             "action": dec["action"],
@@ -1161,13 +1211,90 @@ def quick_signal(symbol, interval, strict_mode, fng_val, fng_label, global_m, ma
             "htf": htf,
             "score": dec["score"],
             "max_score": dec["max_score"],
-            "rr_net": dec.get("rr_net"),
-            "entry": dec.get("entry") or px,
-            "exit": dec.get("exit"),
-            "stop": dec.get("stop"),
+            "rr_net": rr_net,
+            "entry": entry,
+            "exit": exit_px,
+            "stop": stop,
         }
     except Exception:
-        return {"symbol": symbol, "action": "—", "price": None, "rsi": None, "conf": "—"}
+        return {
+            "symbol": symbol, "action": "—", "price": pre.get("price"), "rsi": pre.get("rsi"),
+            "conf": "—", "htf": "—", "score": None, "max_score": None, "rr_net": None,
+            "entry": None, "exit": None, "stop": None,
+        }
+
+
+def run_scanner(scan_pairs, interval, strict_mode, fng_val, fng_label, global_m, macro, news_sent, fee_pct, max_workers=10):
+    """Two-pass: parallel prefilter all → full decide only on candidates."""
+    price_map = binance_all_prices()
+    btc_ret6 = None
+    try:
+        btc_raw = binance_klines("BTCUSDT", interval, 40)
+        if not btc_raw.empty:
+            bt = technicals(btc_raw)
+            if not bt.empty and "ret_6" in bt.columns:
+                btc_ret6 = float(bt.iloc[-1]["ret_6"])
+    except Exception:
+        pass
+
+    pre_map = {}
+    with ThreadPoolExecutor(max_workers=min(max_workers, max(1, len(scan_pairs)))) as ex:
+        futs = {ex.submit(_prefilter_row, sym, interval, price_map): (nm, sym) for nm, sym in scan_pairs}
+        for fut in as_completed(futs):
+            nm, sym = futs[fut]
+            try:
+                pre = fut.result()
+                if pre:
+                    pre["name"] = nm
+                    pre_map[sym] = pre
+            except Exception:
+                continue
+
+    # User-selected list is intentional → full rules on every pair that loaded data
+    candidates = list(pre_map.values())
+
+    full_by_sym = {}
+    with ThreadPoolExecutor(max_workers=min(max_workers, max(1, len(candidates) or 1))) as ex:
+        futs = {
+            ex.submit(
+                _full_from_pre, pre, interval, strict_mode, fng_val, fng_label,
+                global_m, macro, news_sent, fee_pct, btc_ret6,
+            ): pre["symbol"]
+            for pre in candidates
+        }
+        for fut in as_completed(futs):
+            sym = futs[fut]
+            try:
+                full_by_sym[sym] = fut.result()
+            except Exception:
+                full_by_sym[sym] = {"symbol": sym, "action": "—", "price": None, "rsi": None, "conf": "—"}
+
+    rows = []
+    for nm, sym in scan_pairs:
+        pre = pre_map.get(sym)
+        if not pre:
+            rows.append({
+                "Coin": nm, "Pair": sym, "Signal": "—", "Conf": "—", "Price": price_map.get(sym),
+                "RSI": None, "HTF": "—", "Score": None, "Max": None, "Net R:R": None,
+                "Entry": None, "Exit": None, "Stop": None,
+            })
+            continue
+        if sym in full_by_sym:
+            q = full_by_sym[sym]
+            rows.append({
+                "Coin": nm, "Pair": sym, "Signal": q.get("action") or "—", "Conf": q.get("conf") or "—",
+                "Price": q.get("price"), "RSI": q.get("rsi"), "HTF": q.get("htf") or "—",
+                "Score": q.get("score"), "Max": q.get("max_score"), "Net R:R": q.get("rr_net"),
+                "Entry": q.get("entry"), "Exit": q.get("exit"), "Stop": q.get("stop"),
+            })
+        else:
+            rows.append({
+                "Coin": nm, "Pair": sym, "Signal": "WAIT", "Conf": "—",
+                "Price": pre.get("price"), "RSI": pre.get("rsi"), "HTF": "—",
+                "Score": None, "Max": None, "Net R:R": None,
+                "Entry": None, "Exit": None, "Stop": None,
+            })
+    return rows
 
 
 st.sidebar.title("Spot Desk")
@@ -1185,18 +1312,46 @@ fee_pct = st.sidebar.number_input(
     help="e.g. 0.10 = 0.10% fee each side → 0.20% round trip. Used for net R:R.",
 )
 show_scanner = st.sidebar.checkbox("Scanner table", value=True)
-scanner_mode = st.sidebar.radio(
-    "Scanner size",
-    ["Core (fast)", "Full list"],
-    index=0,
-    help="Full list scans every ticker and can take longer on Streamlit Cloud.",
-)
 name = st.sidebar.selectbox("Coin", list(CRYPTO.keys()), index=0)
 symbol = CRYPTO[name]
 custom = st.sidebar.text_input("Or pair", placeholder="BTCUSDT")
 if custom.strip():
     symbol = custom.strip().upper()
     name = symbol
+
+st.sidebar.markdown("##### Scanner list")
+_default_watch = [n for n in [
+    "Bitcoin", "Ethereum", "Solana", "XRP", "BNB",
+    "ONDO", "Polkadot", "Stellar", "Hedera", "Algorand",
+] if n in CRYPTO]
+if "scanner_watch" not in st.session_state:
+    st.session_state["scanner_watch"] = list(_default_watch)
+
+scanner_watch = st.sidebar.multiselect(
+    "Coins to scan (full rules)",
+    options=list(CRYPTO.keys()),
+    key="scanner_watch",
+    help="Only selected coins are scanned with full rules. All tickers remain in Coin menu.",
+)
+
+c_add1, c_add2 = st.sidebar.columns(2)
+with c_add1:
+    if st.button("Add current", use_container_width=True):
+        cur = name if name in CRYPTO else None
+        if cur is None:
+            for k, v in CRYPTO.items():
+                if v == symbol:
+                    cur = k
+                    break
+        if cur and cur not in st.session_state["scanner_watch"]:
+            st.session_state["scanner_watch"] = list(st.session_state["scanner_watch"]) + [cur]
+            st.rerun()
+with c_add2:
+    if st.button("Clear list", use_container_width=True):
+        st.session_state["scanner_watch"] = []
+        st.rerun()
+
+st.sidebar.caption(f"Scanning **{len(st.session_state.get('scanner_watch', []))}** coin(s)")
 
 interval = st.sidebar.selectbox("Timeframe", INTERVALS, index=0)
 account = st.sidebar.number_input("Account $", 100.0, value=10000.0, step=100.0)
@@ -1421,43 +1576,19 @@ c5.metric("Score", f"{dec['score']}/{dec['max_score']}")
 # ── Scanner table (multi-coin) ──
 if show_scanner:
     st.subheader("Scanner")
-    st.caption("Sorted by action then score. Strict + fee-aware net R:R apply. Select a coin in the sidebar for full detail.")
-    # Full ticker universe from CRYPTO (can be slow on first load)
-    CORE = [
-        "Bitcoin", "Ethereum", "Solana", "XRP", "BNB", "Cardano", "Dogecoin",
-        "Avalanche", "Chainlink", "Polkadot", "ONDO", "Stellar", "Hedera",
-        "Algorand", "Sui", "Near", "Toncoin", "Tron", "Litecoin", "Aave",
-        "Uniswap", "Aptos", "Arbitrum", "Optimism", "Injective", "Render",
-        "Pepe", "Shiba Inu", "Worldcoin", "Celestia",
-    ]
-    if scanner_mode.startswith("Full"):
-        scan_names = list(CRYPTO.keys())
+    st.caption("Only your selected watchlist is scanned (full rules). Add/remove coins in the sidebar.")
+    scan_names = list(st.session_state.get("scanner_watch") or [])
+    scan_names = [n for n in scan_names if n in CRYPTO]
+    pairs = [(nm, CRYPTO[nm]) for nm in scan_names if nm in CRYPTO]
+    if not pairs:
+        st.info("Scanner list is empty. Choose coins under **Coins to scan** in the sidebar, or click **Add current**.")
+        rows = []
     else:
-        scan_names = [n for n in CORE if n in CRYPTO]
-    rows = []
-    prog = st.progress(0)
-    for i, nm in enumerate(scan_names):
-        sym = CRYPTO.get(nm)
-        if not sym:
-            continue
-        q = quick_signal(sym, interval, strict_mode, fng_val, fng_label, global_m, macro, news_sent, fee_pct=fee_pct)
-        rows.append({
-            "Coin": nm,
-            "Pair": sym,
-            "Signal": q.get("action") or "—",
-            "Conf": q.get("conf") or "—",
-            "Price": q.get("price"),
-            "RSI": q.get("rsi"),
-            "HTF": q.get("htf") or "—",
-            "Score": q.get("score"),
-            "Max": q.get("max_score"),
-            "Net R:R": q.get("rr_net"),
-            "Entry": q.get("entry"),
-            "Exit": q.get("exit"),
-            "Stop": q.get("stop"),
-        })
-        prog.progress((i + 1) / max(len(scan_names), 1))
-    prog.empty()
+        with st.spinner(f"Scanning {len(pairs)} selected pair(s) with full rules…"):
+            rows = run_scanner(
+                pairs, interval, strict_mode, fng_val, fng_label, global_m, macro, news_sent, fee_pct,
+                max_workers=10,
+            )
     scan_df = pd.DataFrame(rows)
     if not scan_df.empty:
         # sort BUY first, then SELL, then WAIT; then score desc
