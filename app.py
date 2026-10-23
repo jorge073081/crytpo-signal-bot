@@ -56,6 +56,36 @@ CRYPTO = {
     "Near": "NEARUSDT", "Render": "RENDERUSDT", "Pepe": "PEPEUSDT",
     "Toncoin": "TONUSDT", "Tron": "TRXUSDT", "Litecoin": "LTCUSDT",
     "Polkadot": "DOTUSDT", "Aave": "AAVEUSDT",
+    "Polygon": "MATICUSDT", "Uniswap": "UNIUSDT", "Cosmos": "ATOMUSDT",
+    "Filecoin": "FILUSDT", "Internet Computer": "ICPUSDT", "Aptos": "APTUSDT",
+    "Arbitrum": "ARBUSDT", "Optimism": "OPUSDT", "Immutable": "IMXUSDT",
+    "Injective": "INJUSDT", "Sei": "SEIUSDT", "Worldcoin": "WLDUSDT",
+    "Fetch.ai": "FETUSDT", "The Graph": "GRTUSDT", "Sandbox": "SANDUSDT",
+    "Axie": "AXSUSDT", "Gala": "GALAUSDT", "Shiba Inu": "SHIBUSDT",
+    "Bonk": "BONKUSDT", "dogwifhat": "WIFUSDT", "Jupiter": "JUPUSDT",
+    "Pyth": "PYTHUSDT", "Jito": "JTOUSDT", "Stacks": "STXUSDT",
+    "Theta": "THETAUSDT", "VeChain": "VETUSDT", "Maker": "MKRUSDT",
+    "Lido": "LDOUSDT", "Curve": "CRVUSDT", "Mantle": "MNTUSDT",
+    "Celestia": "TIAUSDT", "ORDI": "ORDIUSDT", "Bitcoin Cash": "BCHUSDT",
+    "Ethereum Classic": "ETCUSDT", "EOS": "EOSUSDT", "Tezos": "XTZUSDT",
+    "IOTA": "IOTAUSDT", "Flow": "FLOWUSDT", "Kava": "KAVAUSDT",
+    "Zcash": "ZECUSDT", "Neo": "NEOUSDT", "Quant": "QNTUSDT",
+    "Fantom": "FTMUSDT", "Pendle": "PENDLEUSDT", "Ethena": "ENAUSDT",
+    "Beam": "BEAMXUSDT", "Blur": "BLURUSDT", "dYdX": "DYDXUSDT",
+    "GMX": "GMXUSDT", "1inch": "1INCHUSDT", "Compound": "COMPUSDT",
+    "Sushi": "SUSHIUSDT", "Enjin": "ENJUSDT", "Chiliz": "CHZUSDT",
+    "BAT": "BATUSDT", "Decentraland": "MANAUSDT", "ApeCoin": "APEUSDT",
+    "Mask": "MASKUSDT", "Livepeer": "LPTUSDT", "Arweave": "ARUSDT",
+    "Mina": "MINAUSDT", "Oasis": "ROSEUSDT", "Ankr": "ANKRUSDT",
+    "Celo": "CELOUSDT", "Qtum": "QTUMUSDT", "Zilliqa": "ZILUSDT",
+    "Ravencoin": "RVNUSDT", "Holo": "HOTUSDT", "Ontology": "ONTUSDT",
+    "Storj": "STORJUSDT", "Band": "BANDUSDT", "API3": "API3USDT",
+    "Magic": "MAGICUSDT", "GMT": "GMTUSDT", "Loopring": "LRCUSDT",
+    "Synthetix": "SNXUSDT", "ENS": "ENSUSDT", "SSV": "SSVUSDT",
+    "Trust Wallet": "TWTUSDT", "PancakeSwap": "CAKEUSDT", "Xai": "XAIUSDT",
+    "AltLayer": "ALTUSDT", "Pixels": "PIXELUSDT", "Sleepless AI": "AIUSDT",
+    "Notcoin": "NOTUSDT", "Starknet": "STRKUSDT", "Meme": "MEMEUSDT",
+    "Big Time": "BIGTIMEUSDT", "Gas": "GASUSDT", "Nexo": "NEXOUSDT",
 }
 INTERVALS = ["15m", "30m", "1h", "4h", "1d"]
 HTF_MAP = {"15m": "1h", "30m": "4h", "1h": "4h", "4h": "1d", "1d": "1d"}
@@ -70,6 +100,20 @@ CG_IDS = {
     "NEARUSDT": "near", "RENDERUSDT": "render-token", "PEPEUSDT": "pepe",
     "TONUSDT": "the-open-network", "TRXUSDT": "tron", "LTCUSDT": "litecoin",
     "DOTUSDT": "polkadot", "AAVEUSDT": "aave",
+    "MATICUSDT": "matic-network", "UNIUSDT": "uniswap", "ATOMUSDT": "cosmos",
+    "FILUSDT": "filecoin", "ICPUSDT": "internet-computer", "APTUSDT": "aptos",
+    "ARBUSDT": "arbitrum", "OPUSDT": "optimism", "IMXUSDT": "immutable-x",
+    "INJUSDT": "injective-protocol", "SEIUSDT": "sei-network", "WLDUSDT": "worldcoin-wld",
+    "FETUSDT": "fetch-ai", "GRTUSDT": "the-graph", "SANDUSDT": "the-sandbox",
+    "AXSUSDT": "axie-infinity", "GALAUSDT": "gala", "SHIBUSDT": "shiba-inu",
+    "BONKUSDT": "bonk", "WIFUSDT": "dogwifcoin", "JUPUSDT": "jupiter-exchange-solana",
+    "PYTHUSDT": "pyth-network", "STXUSDT": "blockstack", "THETAUSDT": "theta-token",
+    "VETUSDT": "vechain", "MKRUSDT": "maker", "LDOUSDT": "lido-dao",
+    "CRVUSDT": "curve-dao-token", "TIAUSDT": "celestia", "BCHUSDT": "bitcoin-cash",
+    "ETCUSDT": "ethereum-classic", "FTMUSDT": "fantom", "ENAUSDT": "ethena",
+    "PENDLEUSDT": "pendle", "DYDXUSDT": "dydx-chain", "MANAUSDT": "decentraland",
+    "APEUSDT": "apecoin", "ARUSDT": "arweave", "CAKEUSDT": "pancakeswap-token",
+    "NOTUSDT": "notcoin", "STRKUSDT": "starknet",
 }
 
 # DefiLlama protocol slugs (token/project TVL when chain TVL is weak)
@@ -1141,6 +1185,12 @@ fee_pct = st.sidebar.number_input(
     help="e.g. 0.10 = 0.10% fee each side → 0.20% round trip. Used for net R:R.",
 )
 show_scanner = st.sidebar.checkbox("Scanner table", value=True)
+scanner_mode = st.sidebar.radio(
+    "Scanner size",
+    ["Core (fast)", "Full list"],
+    index=0,
+    help="Full list scans every ticker and can take longer on Streamlit Cloud.",
+)
 name = st.sidebar.selectbox("Coin", list(CRYPTO.keys()), index=0)
 symbol = CRYPTO[name]
 custom = st.sidebar.text_input("Or pair", placeholder="BTCUSDT")
@@ -1372,11 +1422,18 @@ c5.metric("Score", f"{dec['score']}/{dec['max_score']}")
 if show_scanner:
     st.subheader("Scanner")
     st.caption("Sorted by action then score. Strict + fee-aware net R:R apply. Select a coin in the sidebar for full detail.")
-    scan_names = [
-        "Bitcoin", "Ethereum", "Solana", "XRP", "Polkadot", "ONDO",
-        "Stellar", "Hedera", "Algorand", "BNB", "Cardano", "Avalanche",
-        "Chainlink", "Sui", "Near",
+    # Full ticker universe from CRYPTO (can be slow on first load)
+    CORE = [
+        "Bitcoin", "Ethereum", "Solana", "XRP", "BNB", "Cardano", "Dogecoin",
+        "Avalanche", "Chainlink", "Polkadot", "ONDO", "Stellar", "Hedera",
+        "Algorand", "Sui", "Near", "Toncoin", "Tron", "Litecoin", "Aave",
+        "Uniswap", "Aptos", "Arbitrum", "Optimism", "Injective", "Render",
+        "Pepe", "Shiba Inu", "Worldcoin", "Celestia",
     ]
+    if scanner_mode.startswith("Full"):
+        scan_names = list(CRYPTO.keys())
+    else:
+        scan_names = [n for n in CORE if n in CRYPTO]
     rows = []
     prog = st.progress(0)
     for i, nm in enumerate(scan_names):
